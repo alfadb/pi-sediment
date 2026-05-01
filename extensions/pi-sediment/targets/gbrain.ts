@@ -8,6 +8,7 @@
 
 import { spawn } from "node:child_process";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { sanitizeSlug } from "../utils.js";
 import type { GbrainEntry } from "../types.js";
@@ -42,10 +43,21 @@ export async function writeToGbrain(
     "--tags", entry.tags.join(","),
   ];
 
+  // Write content to temp file — gbrain's Bun runtime has stdin issues
+  // when spawned from Node.js (ENXIO: open '/dev/stdin').
+  let tmpPath = "";
+  try {
+    tmpPath = path.join(os.tmpdir(), `pi-sediment-gbrain-${slug}.md`);
+    fs.writeFileSync(tmpPath, entry.content, "utf8");
+  } catch (e: any) {
+    logLine(projectRoot, `gbrain write:tmpfail slug=${slug} ${e.message}`);
+    return false;
+  }
+
   return new Promise((resolve) => {
-    const child = spawn("gbrain", args, {
-      cwd: `${process.env.HOME}/gbrain`,
-      stdio: ["pipe", "pipe", "pipe"],
+    const child = spawn("bash", ["-c", `cat ${JSON.stringify(tmpPath)} | gbrain ${args.map(a => JSON.stringify(a)).join(" ")}; rm -f ${JSON.stringify(tmpPath)}`], {
+      cwd: path.join(os.homedir(), "gbrain"),
+      stdio: ["ignore", "pipe", "pipe"],
     });
 
     let stderr = "";
@@ -56,7 +68,6 @@ export async function writeToGbrain(
     }, 15_000);
 
     child.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
-    // stdout consumed but not used
     child.stdout.on("data", () => {});
 
     child.on("error", (e) => {
@@ -78,9 +89,5 @@ export async function writeToGbrain(
         resolve(false);
       }
     });
-
-    // Write content to stdin and close — must happen after listeners are set up
-    child.stdin.write(entry.content);
-    child.stdin.end();
   });
 }
