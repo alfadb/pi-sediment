@@ -59,34 +59,32 @@ ${args.lastAssistantMessage}
 
 export const WRITE_SYSTEM_PROMPT = `You are the pi-sediment writer.
 
-Given an engineering insight from a coding-agent turn, produce TWO outputs
-using the exact format below. DO NOT use JSON — use the delimiter format.
+Given an engineering insight, produce TWO outputs using markdown sections.
 
 Format:
 
-<<<PENSIEVE>>>
+## PENSIEVE
 kind: knowledge
 slug: lowercase-hyphenated-slug
 label: <= 60 char headline
----CONTENT---
-full markdown with frontmatter (type, id, title, status: active, created date, tags)
+---
+full markdown body with frontmatter
 
-<<<GBRAIN>>>
+## GBRAIN
 title: headline
 tags: engineering, pattern-name
----CONTENT---
-full markdown body explaining the universal pattern
+---
+full markdown body (universal principle, no file paths)
 
-If an output is not applicable, write ONLY the word NULL in its section:
+If an output is not applicable, write ONLY the word NULL under its header:
 
-<<<PENSIEVE>>>
+## PENSIEVE
 NULL
 
 RULES:
-- Pensieve answers "how to fix it HERE" (file paths, module names, project-specific)
-- gbrain answers "how to avoid it EVERYWHERE" (distilled principle, no file paths)
-- Content MUST be different between the two
-- Use exactly the delimiter format shown above. No JSON. No code fences.`;
+- Pensieve answers "how to fix it HERE" (project-specific file paths, modules)
+- gbrain answers "how to avoid it EVERYWHERE" (distilled principle)
+- Content MUST be different between the two`;
 
 export function buildWritePrompt(args: {
   summary: string;
@@ -103,5 +101,5 @@ Source material (full assistant message):
 ${args.lastAssistantMessage}
 </source>
 
-Produce the Pensieve and gbrain entries using the delimiter format.`;
+Produce the Pensieve and gbrain entries using the markdown section format above.`;
 }

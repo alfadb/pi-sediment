@@ -37,20 +37,17 @@ function extractWriteOutput(text: string): WriterOutput | null {
 }
 
 function extractSection(text: string, name: string): string | null {
-  const marker = `<<<${name}>>>`;
-  const nextMarker = name === "PENSIEVE" ? "<<<GBRAIN>>>" : null;
+  // Match markdown header: ## NAME or ## NAME (with trailing text)
+  const headerRegex = new RegExp(`^##\\s+${name}\\s*$`, "mi");
+  const match = text.match(headerRegex);
+  if (!match || match.index === undefined) return null;
 
-  const start = text.indexOf(marker);
-  if (start === -1) return null;
-
-  const bodyStart = start + marker.length;
-  let bodyEnd: number;
-  if (nextMarker) {
-    const nextIdx = text.indexOf(nextMarker, bodyStart);
-    bodyEnd = nextIdx !== -1 ? nextIdx : text.length;
-  } else {
-    bodyEnd = text.length;
-  }
+  const bodyStart = match.index + match[0].length;
+  // Find the next ## header as boundary
+  const nextHeader = text.slice(bodyStart).match(/^##\s+/m);
+  const bodyEnd = nextHeader && nextHeader.index !== undefined
+    ? bodyStart + nextHeader.index
+    : text.length;
 
   const body = text.slice(bodyStart, bodyEnd).trim();
   if (!body || body === "NULL") return null;
@@ -58,10 +55,10 @@ function extractSection(text: string, name: string): string | null {
 }
 
 function parsePensieveSection(raw: string): WriterOutput["pensieve"] {
-  // Parse header fields and content separated by ---CONTENT---
-  const contentSplit = raw.split("---CONTENT---");
-  const header = contentSplit[0]?.trim() ?? "";
-  const content = contentSplit.slice(1).join("---CONTENT---").trim();
+  // Split header fields from content by "---"
+  const parts = raw.split(/^---$/m);
+  const header = parts[0]?.trim() ?? "";
+  const content = parts.slice(1).join("\n---\n").trim();
 
   if (!content || content.length < 50) return null;
 
@@ -77,9 +74,9 @@ function parsePensieveSection(raw: string): WriterOutput["pensieve"] {
 }
 
 function parseGbrainSection(raw: string): WriterOutput["gbrain"] {
-  const contentSplit = raw.split("---CONTENT---");
-  const header = contentSplit[0]?.trim() ?? "";
-  const content = contentSplit.slice(1).join("---CONTENT---").trim();
+  const parts = raw.split(/^---$/m);
+  const header = parts[0]?.trim() ?? "";
+  const content = parts.slice(1).join("\n---\n").trim();
 
   if (!content || content.length < 50) return null;
 
