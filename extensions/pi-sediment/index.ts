@@ -22,6 +22,7 @@
 import type {
   AgentEndEvent,
   ExtensionAPI,
+  SessionShutdownEvent,
   SessionStartEvent,
 } from "@mariozechner/pi-coding-agent";
 
@@ -138,6 +139,13 @@ export default function piSediment(pi: ExtensionAPI) {
     if (ctx.hasUI) {
       try { ctx.ui.setStatus("pi-sediment", formatStatus(targets)); } catch {}
     }
+  });
+
+  // ── session_shutdown: cleanup ────────────────────────────
+  pi.on("session_shutdown", (_event: SessionShutdownEvent, ctx) => {
+    const sid = ctx.sessionManager.getSessionFile?.() ?? "ephemeral";
+    clearSession(sid);
+    sessionStates.delete(sid);
   });
 
   // ── agent_end: push to queue ───────────────────────────────
