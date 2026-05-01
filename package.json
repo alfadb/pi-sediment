@@ -1,0 +1,15 @@
+{
+  "name": "pi-sediment",
+  "version": "0.1.0",
+  "description": "Unified auto-sediment engine for pi — extracts durable insights from agent turns and routes them to Pensieve (project knowledge) and gbrain (world knowledge)",
+  "keywords": ["pi-package", "pensieve", "gbrain", "knowledge-management", "auto-sediment"],
+  "license": "MIT",
+  "pi": {
+    "extensions": ["./extensions/pi-sediment"]
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-ai": "*",
+    "typebox": "*"
+  }
+}
