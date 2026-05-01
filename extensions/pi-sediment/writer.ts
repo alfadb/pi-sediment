@@ -65,6 +65,9 @@ function parsePensieveSection(raw: string): WriterOutput["pensieve"] {
   const content = parts.slice(1).join("__CONTENT__").trim();
 
   if (!content || content.length < 300) return null;
+  // Validate Pensieve frontmatter
+  if (!content.startsWith("---")) return null;
+  if (!/^type:\s*(knowledge|decision|maxim)/m.test(content)) return null;
 
   const kind = extractField(header, "kind") as "knowledge" | "decision" | "maxim" | null;
   if (!kind || !["knowledge", "decision", "maxim"].includes(kind)) return null;
@@ -148,7 +151,7 @@ export async function write(
         apiKey: resolved.apiKey,
         headers: resolved.headers,
         signal: ac.signal,
-        maxTokens: 16384,
+        maxTokens: 32768,
       },
     );
 

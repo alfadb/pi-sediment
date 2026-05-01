@@ -68,7 +68,19 @@ kind: knowledge
 slug: lowercase-hyphenated-slug
 label: <= 60 char headline
 __CONTENT__
-full markdown body with frontmatter
+```
+---
+type: knowledge
+id: slug
+status: active
+created: YYYY-MM-DD
+tags: [tag1, tag2]
+---
+
+# Title
+
+Body content with file paths, module names, project specifics...
+```
 
 ## GBRAIN
 title: headline
