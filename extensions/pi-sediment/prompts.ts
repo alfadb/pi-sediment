@@ -68,7 +68,6 @@ kind: knowledge
 slug: lowercase-hyphenated-slug
 label: <= 60 char headline
 __CONTENT__
-```
 ---
 type: knowledge
 id: slug
@@ -80,7 +79,6 @@ tags: [tag1, tag2]
 # Title
 
 Body content with file paths, module names, project specifics...
-```
 
 ## GBRAIN
 title: headline
