@@ -59,46 +59,34 @@ ${args.lastAssistantMessage}
 
 export const WRITE_SYSTEM_PROMPT = `You are the pi-sediment writer.
 
-Given an engineering insight from a coding-agent turn, produce TWO outputs:
+Given an engineering insight from a coding-agent turn, produce TWO outputs
+using the exact format below. DO NOT use JSON — use the delimiter format.
 
-1. A Pensieve entry — project-level knowledge.
-   How to fix it in THIS project. Include file paths, module names, specific
-   code patterns. Output as a complete markdown file with frontmatter:
-     - type: "knowledge" | "decision" | "maxim"
-     - id, title, status: "active", created (ISO date), tags
-     - Body follows Pensieve reference format
+Format:
 
-2. A gbrain entry — cross-project engineering principle.
-   How to AVOID this in ANY project. Distill the universal pattern, not the
-   project specifics. Output as a complete markdown page:
-     - title (concise headline)
-     - tags (2-4 comma-separated keywords including "engineering")
-     - Body explains: what pattern, why it happens, how to detect it,
-       how to fix/avoid it, when it applies
+<<<PENSIEVE>>>
+kind: knowledge
+slug: lowercase-hyphenated-slug
+label: <= 60 char headline
+---CONTENT---
+full markdown with frontmatter (type, id, title, status: active, created date, tags)
 
-CRITICAL: The Pensieve entry and gbrain entry MUST be different content.
-- Pensieve answers "how to fix it HERE"
-- gbrain answers "how to avoid it EVERYWHERE"
+<<<GBRAIN>>>
+title: headline
+tags: engineering, pattern-name
+---CONTENT---
+full markdown body explaining the universal pattern
 
-If the insight is purely project-specific (no universal principle), output
-null for gbrain. If the insight is purely universal (no project file paths),
-output null for Pensieve.
+If an output is not applicable, write ONLY the word NULL in its section:
 
-Output ONLY a JSON block:
+<<<PENSIEVE>>>
+NULL
 
-{
-  "pensieve": {
-    "kind": "knowledge" | "decision" | "maxim",
-    "slug": "lowercase-hyphenated",
-    "label": "<= 60 char headline",
-    "content": "full markdown with frontmatter"
-  } | null,
-  "gbrain": {
-    "title": "headline",
-    "tags": ["engineering", "..."],
-    "content": "full markdown body"
-  } | null
-}`;
+RULES:
+- Pensieve answers "how to fix it HERE" (file paths, module names, project-specific)
+- gbrain answers "how to avoid it EVERYWHERE" (distilled principle, no file paths)
+- Content MUST be different between the two
+- Use exactly the delimiter format shown above. No JSON. No code fences.`;
 
 export function buildWritePrompt(args: {
   summary: string;
@@ -115,5 +103,5 @@ Source material (full assistant message):
 ${args.lastAssistantMessage}
 </source>
 
-Produce the Pensieve and gbrain entries now.`;
+Produce the Pensieve and gbrain entries using the delimiter format.`;
 }

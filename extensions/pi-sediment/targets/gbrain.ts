@@ -6,7 +6,7 @@
  * gbrain unavailable → silent skip.
  */
 
-import { execFile } from "node:child_process";
+import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { sanitizeSlug } from "../utils.js";
@@ -43,35 +43,44 @@ export async function writeToGbrain(
   ];
 
   return new Promise((resolve) => {
-    const child = execFile("gbrain", args, {
+    const child = spawn("gbrain", args, {
       cwd: `${process.env.HOME}/gbrain`,
-      timeout: 15_000,
-      maxBuffer: 10 * 1024 * 1024,
-    }, (err, _stdout, stderr) => {
-      if (err) {
-        const code = (err as any).code ?? 1;
-        const msg = stderr?.trim() ?? err.message;
-        if (throttleErr(msg)) {
-          logLine(projectRoot, `gbrain write:throttle slug=${slug} → deferred`);
-          resolve(true); // not a hard failure
-        } else {
-          logLine(projectRoot, `gbrain write:fail slug=${slug} code=${code} ${msg.slice(0, 200)}`);
-          resolve(false);
-        }
-        return;
-      }
-      logLine(projectRoot, `gbrain write:ok slug=${slug}`);
-      resolve(true);
+      stdio: ["pipe", "pipe", "pipe"],
     });
 
-    if (child.stdin) {
-      child.stdin.write(entry.content);
-      child.stdin.end();
-    }
+    let stderr = "";
+    const timer = setTimeout(() => {
+      child.kill();
+      logLine(projectRoot, `gbrain write:timeout slug=${slug}`);
+      resolve(false);
+    }, 15_000);
+
+    child.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
+    // stdout consumed but not used
+    child.stdout.on("data", () => {});
 
     child.on("error", (e) => {
+      clearTimeout(timer);
       logLine(projectRoot, `gbrain write:error slug=${slug} ${e.message}`);
       resolve(false);
     });
+
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (code === 0) {
+        logLine(projectRoot, `gbrain write:ok slug=${slug}`);
+        resolve(true);
+      } else if (throttleErr(stderr)) {
+        logLine(projectRoot, `gbrain write:throttle slug=${slug} → deferred`);
+        resolve(true);
+      } else {
+        logLine(projectRoot, `gbrain write:fail slug=${slug} code=${code} ${stderr.slice(0, 200)}`);
+        resolve(false);
+      }
+    });
+
+    // Write content to stdin and close — must happen after listeners are set up
+    child.stdin.write(entry.content);
+    child.stdin.end();
   });
 }

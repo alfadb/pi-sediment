@@ -25,48 +25,78 @@ async function resolveModel(
   return { model: m, apiKey: auth.apiKey, headers: auth.headers, display: formatModelRef(config.model) };
 }
 
-function extractWriteJson(text: string): WriterOutput | null {
-  let body = text;
-  const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/);
-  if (fence) body = fence[1];
-  const open = body.indexOf("{");
-  const close = body.lastIndexOf("}");
-  if (open === -1 || close === -1 || close <= open) return null;
-  let parsed: any;
-  try { parsed = JSON.parse(body.slice(open, close + 1)); } catch { return null; }
-  if (!parsed || typeof parsed !== "object") return null;
+function extractWriteOutput(text: string): WriterOutput | null {
+  const pensieveRaw = extractSection(text, "PENSIEVE");
+  const gbrainRaw = extractSection(text, "GBRAIN");
 
-  const pensieve = parsePensieveEntry(parsed.pensieve);
-  const gbrain = parseGbrainEntry(parsed.gbrain);
+  const pensieve = pensieveRaw ? parsePensieveSection(pensieveRaw) : null;
+  const gbrain = gbrainRaw ? parseGbrainSection(gbrainRaw) : null;
 
   if (!pensieve && !gbrain) return null;
   return { pensieve, gbrain };
 }
 
-function parsePensieveEntry(raw: any): WriterOutput["pensieve"] {
-  if (!raw || typeof raw !== "object") return null;
-  const kind = raw.kind;
-  if (kind !== "knowledge" && kind !== "decision" && kind !== "maxim") return null;
-  const slug = typeof raw.slug === "string" ? raw.slug.trim() : "";
+function extractSection(text: string, name: string): string | null {
+  const marker = `<<<${name}>>>`;
+  const nextMarker = name === "PENSIEVE" ? "<<<GBRAIN>>>" : null;
+
+  const start = text.indexOf(marker);
+  if (start === -1) return null;
+
+  const bodyStart = start + marker.length;
+  let bodyEnd: number;
+  if (nextMarker) {
+    const nextIdx = text.indexOf(nextMarker, bodyStart);
+    bodyEnd = nextIdx !== -1 ? nextIdx : text.length;
+  } else {
+    bodyEnd = text.length;
+  }
+
+  const body = text.slice(bodyStart, bodyEnd).trim();
+  if (!body || body === "NULL") return null;
+  return body;
+}
+
+function parsePensieveSection(raw: string): WriterOutput["pensieve"] {
+  // Parse header fields and content separated by ---CONTENT---
+  const contentSplit = raw.split("---CONTENT---");
+  const header = contentSplit[0]?.trim() ?? "";
+  const content = contentSplit.slice(1).join("---CONTENT---").trim();
+
+  if (!content || content.length < 50) return null;
+
+  const kind = extractField(header, "kind") as "knowledge" | "decision" | "maxim" | null;
+  if (!kind || !["knowledge", "decision", "maxim"].includes(kind)) return null;
+
+  const slug = extractField(header, "slug");
   if (!slug) return null;
-  const label = typeof raw.label === "string" ? raw.label.trim() : slug;
-  const content = typeof raw.content === "string" ? raw.content.trim() : "";
-  if (content.length < 50) return null;
+
+  const label = extractField(header, "label") || slug;
+
   return { kind, slug, label, content };
 }
 
-function parseGbrainEntry(raw: any): WriterOutput["gbrain"] {
-  if (!raw || typeof raw !== "object") return null;
-  const title = typeof raw.title === "string" ? raw.title.trim() : "";
+function parseGbrainSection(raw: string): WriterOutput["gbrain"] {
+  const contentSplit = raw.split("---CONTENT---");
+  const header = contentSplit[0]?.trim() ?? "";
+  const content = contentSplit.slice(1).join("---CONTENT---").trim();
+
+  if (!content || content.length < 50) return null;
+
+  const title = extractField(header, "title");
   if (!title) return null;
-  const content = typeof raw.content === "string" ? raw.content.trim() : "";
-  if (content.length < 50) return null;
-  let tags: string[] = [];
-  if (Array.isArray(raw.tags)) {
-    tags = raw.tags.filter((t: any) => typeof t === "string").map((t: string) => t.trim().toLowerCase());
-  }
+
+  const tagsRaw = extractField(header, "tags");
+  let tags = tagsRaw ? tagsRaw.split(",").map((t) => t.trim().toLowerCase()).filter(Boolean) : [];
   if (!tags.includes("engineering")) tags.unshift("engineering");
+
   return { title, tags, content };
+}
+
+function extractField(header: string, field: string): string | null {
+  const regex = new RegExp(`^${field}:\\s*(.+)$`, "mi");
+  const match = header.match(regex);
+  return match?.[1]?.trim() ?? null;
 }
 
 function logLine(projectRoot: string, line: string): void {
@@ -135,7 +165,7 @@ export async function write(
       .map((c) => c.text)
       .join("\n");
 
-    const result = extractWriteJson(text);
+    const result = extractWriteOutput(text);
     if (!result) {
       logLine(projectRoot, `${tag} parse:fail rawlen=${text.length}`);
       return { pensieve: null, gbrain: null };
