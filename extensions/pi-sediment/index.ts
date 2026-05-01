@@ -53,8 +53,8 @@ function formatStatus(targets: TargetStatus): string {
   const parts: string[] = [];
   if (targets.pensieve) parts.push("pensieve");
   if (targets.gbrain) parts.push("gbrain");
-  if (parts.length === 0) return "sediment: no targets";
-  return `sediment → ${parts.join("+")}`;
+  if (parts.length === 0) return "⏳ sediment: no targets";
+  return `⏳ sediment → ${parts.join("+")}`;
 }
 
 // ── Worker callback ────────────────────────────────────────────
