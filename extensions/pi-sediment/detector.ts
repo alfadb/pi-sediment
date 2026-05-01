@@ -34,7 +34,7 @@ interface GbrainDoctor {
 
 async function detectGbrain(): Promise<{ available: boolean; pageCount: number | null }> {
   try {
-    const { stdout, stderr } = await execFileP("gbrain", ["doctor", "--json"], {
+    const { stdout } = await execFileP("gbrain", ["doctor", "--json"], {
       timeout: 10_000,
       maxBuffer: 1024 * 1024,
       cwd: `${process.env.HOME}/gbrain`,

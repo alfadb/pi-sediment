@@ -9,18 +9,10 @@
 import { execFile } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { sanitizeSlug } from "../utils.js";
 import type { GbrainEntry } from "../types.js";
 
 // ── Helpers ────────────────────────────────────────────────────
-
-function sanitizeSlug(raw: string): string {
-  return raw
-    .toLowerCase()
-    .replace(/[^a-z0-9-]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .replace(/-+/g, "-")
-    .slice(0, 80);
-}
 
 function throttleErr(stderr: string): boolean {
   const kw = ["throttle", "rate limit", "capacity", "busy"];
