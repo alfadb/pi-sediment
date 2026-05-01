@@ -26,8 +26,13 @@ async function resolveModel(
 }
 
 function extractWriteOutput(text: string): WriterOutput | null {
-  const pensieveRaw = extractSection(text, "PENSIEVE");
-  const gbrainRaw = extractSection(text, "GBRAIN");
+  // Strip outer code fences if present (model sometimes wraps output)
+  let clean = text.trim();
+  const fenceMatch = clean.match(/^```(?:markdown|md)?\s*\n([\s\S]*?)\n```\s*$/);
+  if (fenceMatch) clean = fenceMatch[1];
+
+  const pensieveRaw = extractSection(clean, "PENSIEVE");
+  const gbrainRaw = extractSection(clean, "GBRAIN");
 
   const pensieve = pensieveRaw ? parsePensieveSection(pensieveRaw) : null;
   const gbrain = gbrainRaw ? parseGbrainSection(gbrainRaw) : null;
@@ -55,10 +60,9 @@ function extractSection(text: string, name: string): string | null {
 }
 
 function parsePensieveSection(raw: string): WriterOutput["pensieve"] {
-  // Split header fields from content by "---"
-  const parts = raw.split(/^---$/m);
+  const parts = raw.split("__CONTENT__");
   const header = parts[0]?.trim() ?? "";
-  const content = parts.slice(1).join("\n---\n").trim();
+  const content = parts.slice(1).join("__CONTENT__").trim();
 
   if (!content || content.length < 50) return null;
 
@@ -74,9 +78,9 @@ function parsePensieveSection(raw: string): WriterOutput["pensieve"] {
 }
 
 function parseGbrainSection(raw: string): WriterOutput["gbrain"] {
-  const parts = raw.split(/^---$/m);
+  const parts = raw.split("__CONTENT__");
   const header = parts[0]?.trim() ?? "";
-  const content = parts.slice(1).join("\n---\n").trim();
+  const content = parts.slice(1).join("__CONTENT__").trim();
 
   if (!content || content.length < 50) return null;
 

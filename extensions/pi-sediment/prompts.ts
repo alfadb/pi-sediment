@@ -67,13 +67,13 @@ Format:
 kind: knowledge
 slug: lowercase-hyphenated-slug
 label: <= 60 char headline
----
+__CONTENT__
 full markdown body with frontmatter
 
 ## GBRAIN
 title: headline
 tags: engineering, pattern-name
----
+__CONTENT__
 full markdown body (universal principle, no file paths)
 
 If an output is not applicable, write ONLY the word NULL under its header:
