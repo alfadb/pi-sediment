@@ -33,8 +33,18 @@ import { write } from "./writer.js";
 import { writeToPensieve } from "./targets/pensieve.js";
 import { writeToGbrain } from "./targets/gbrain.js";
 import type { QueueItem, TargetStatus } from "./types.js";
+import * as fs from "node:fs";
+import * as path from "node:path";
 
 // ── Extract text from assistant message ────────────────────────
+
+function logLine(projectRoot: string, line: string): void {
+  try {
+    const dir = path.join(projectRoot, ".pi-sediment");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.appendFileSync(path.join(dir, "sidecar.log"), `${new Date().toISOString()} ${line}\n`);
+  } catch { /* silent */ }
+}
 
 function extractText(content: unknown): string {
   if (typeof content === "string") return content;
@@ -84,16 +94,25 @@ async function processItem(item: QueueItem, ctx: any): Promise<void> {
   if (!writeResult.pensieve && !writeResult.gbrain) return;
 
   // 3. Write to targets — parallel, both must complete
-  const promises: Promise<unknown>[] = [];
+  const results = await Promise.all([
+    writeResult.pensieve && item.targets.pensieve
+      ? writeToPensieve(writeResult.pensieve, item.projectRoot).then((ok) => ({ target: "pensieve" as const, ok, label: writeResult.pensieve!.label }))
+      : Promise.resolve(null),
+    writeResult.gbrain && item.targets.gbrain
+      ? writeToGbrain(writeResult.gbrain, item.projectRoot).then((ok) => ({ target: "gbrain" as const, ok, label: writeResult.gbrain!.title }))
+      : Promise.resolve(null),
+  ]);
 
-  if (writeResult.pensieve && item.targets.pensieve) {
-    promises.push(writeToPensieve(writeResult.pensieve, item.projectRoot));
+  // Log results
+  const writtenParts: string[] = [];
+  for (const r of results) {
+    if (!r) continue;
+    const status = r.ok ? "✓" : "✗";
+    writtenParts.push(`${r.target}:${status}`);
   }
-  if (writeResult.gbrain && item.targets.gbrain) {
-    promises.push(writeToGbrain(writeResult.gbrain, item.projectRoot));
+  if (writtenParts.length > 0) {
+    logLine(item.projectRoot, `sediment done: ${writtenParts.join(" ")}`);
   }
-
-  await Promise.all(promises);
 
   // 4. Notify (non-blocking, one line)
   const labels: string[] = [];
