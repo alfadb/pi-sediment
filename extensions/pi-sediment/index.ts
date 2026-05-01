@@ -82,6 +82,11 @@ async function processItem(item: QueueItem, ctx: any): Promise<void> {
 
   if (evalResult.decision === "skip") return;
 
+  // Status: writing
+  if (ctx.hasUI) {
+    try { ctx.ui.setStatus("pi-sediment", "⏳ sediment: writing..."); } catch {}
+  }
+
   // 2. Write (single call, dual output)
   const writeResult = await write(
     evalResult.summary,
@@ -91,7 +96,12 @@ async function processItem(item: QueueItem, ctx: any): Promise<void> {
     item.signal,
   );
 
-  if (!writeResult.pensieve && !writeResult.gbrain) return;
+  if (!writeResult.pensieve && !writeResult.gbrain) {
+    if (ctx.hasUI) {
+      try { ctx.ui.setStatus("pi-sediment", formatStatus(item.targets)); } catch {}
+    }
+    return;
+  }
 
   // 3. Write to targets — parallel, both must complete
   const results = await Promise.all([
@@ -112,6 +122,11 @@ async function processItem(item: QueueItem, ctx: any): Promise<void> {
   }
   if (writtenParts.length > 0) {
     logLine(item.projectRoot, `sediment done: ${writtenParts.join(" ")}`);
+  }
+
+  // Revert status bar
+  if (ctx.hasUI) {
+    try { ctx.ui.setStatus("pi-sediment", formatStatus(item.targets)); } catch {}
   }
 
   // 4. Notify (non-blocking, one line)
