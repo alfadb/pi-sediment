@@ -2,10 +2,12 @@
  * pi-sediment config — model resolution.
  *
  * Default model: deepseek/deepseek-v4-pro
+ * Default reasoning: xhigh
+ *
  * Override priority (high → low):
- *   1. env: PI_SEDIMENT_MODEL
- *   2. project: .pi-sediment/config.json → model
- *   3. default: deepseek/deepseek-v4-pro
+ *   1. env: PI_SEDIMENT_MODEL / PI_SEDIMENT_REASONING
+ *   2. project: .pi-sediment/config.json → model / reasoning
+ *   3. default: deepseek/deepseek-v4-pro / xhigh
  *
  * Hot-reloaded on every agent_end so users can tweak without restart.
  */
@@ -18,8 +20,11 @@ export interface ModelRef {
   modelId: string;
 }
 
+export type ReasoningLevel = "off" | "high" | "xhigh";
+
 export interface SedimentConfig {
   model: ModelRef;
+  reasoning: ReasoningLevel;
   evalTimeoutMs: number;
   writeTimeoutMs: number;
 }
@@ -28,6 +33,8 @@ const DEFAULT_MODEL: ModelRef = {
   provider: "deepseek",
   modelId: "deepseek-v4-pro",
 };
+
+const DEFAULT_REASONING: ReasoningLevel = "xhigh";
 
 // ── Helpers ────────────────────────────────────────────────────
 
@@ -58,12 +65,27 @@ export function loadConfig(projectRoot: string): SedimentConfig {
   const projectConfig = readJsonSafe(path.join(projectRoot, ".pi-sediment", "config.json"));
   const projectRef = parseModelRef(projectConfig?.model);
 
-  // 3. default
+  // 3. reasoning: env > config > default
+  const envReasoning = parseReasoning(process.env.PI_SEDIMENT_REASONING);
+  const configReasoning = parseReasoning(projectConfig?.reasoning);
+  const reasoning = envReasoning ?? configReasoning ?? DEFAULT_REASONING;
+
+  // 4. default
   const model = envRef ?? projectRef ?? DEFAULT_MODEL;
 
   return {
     model,
+    reasoning,
     evalTimeoutMs: 30_000,
     writeTimeoutMs: 90_000,
   };
+}
+
+function parseReasoning(s: string | undefined | null): ReasoningLevel | null {
+  if (!s || typeof s !== "string") return null;
+  const trimmed = s.trim().toLowerCase();
+  if (trimmed === "off" || trimmed === "high" || trimmed === "xhigh") {
+    return trimmed as ReasoningLevel;
+  }
+  return null;
 }

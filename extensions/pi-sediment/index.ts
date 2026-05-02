@@ -35,7 +35,7 @@ import { write } from "./writer.js";
 import { writeToPensieve } from "./targets/pensieve.js";
 import { writeToGbrainWithRetry, type GbrainTranslateFn } from "./targets/gbrain.js";
 import { loadConfig } from "./config.js";
-import { complete } from "@mariozechner/pi-ai";
+import { completeSimple } from "@mariozechner/pi-ai";
 import type { QueueItem, TargetStatus } from "./types.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -107,7 +107,7 @@ async function translateGbrainEntry(
       entry.content,
     ].join("\n");
 
-    const response = await complete(
+    const response = await completeSimple(
       model,
       {
         systemPrompt: TRANSLATE_SYSTEM_PROMPT,
@@ -122,6 +122,7 @@ async function translateGbrainEntry(
         headers: auth.headers,
         signal: ac.signal,
         maxTokens: 8192,
+        ...(config.reasoning !== "off" ? { reasoning: config.reasoning } : {}),
       },
     );
 

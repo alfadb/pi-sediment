@@ -2,7 +2,7 @@
  * pi-sediment evaluator — calls model to decide skip/sediment.
  */
 
-import { complete } from "@mariozechner/pi-ai";
+import { completeSimple } from "@mariozechner/pi-ai";
 import type { ModelRegistry } from "@mariozechner/pi-coding-agent";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -75,7 +75,7 @@ export async function evaluate(
   signal?.addEventListener("abort", onParent, { once: true });
 
   try {
-    const response = await complete(
+    const response = await completeSimple(
       resolved.model,
       {
         systemPrompt: EVAL_SYSTEM_PROMPT,
@@ -90,6 +90,7 @@ export async function evaluate(
         headers: resolved.headers,
         signal: ac.signal,
         maxTokens: 512,
+        ...(config.reasoning !== "off" ? { reasoning: config.reasoning } : {}),
       },
     );
 

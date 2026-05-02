@@ -2,7 +2,7 @@
  * pi-sediment writer — single model call produces Pensieve + gbrain dual output.
  */
 
-import { complete } from "@mariozechner/pi-ai";
+import { completeSimple } from "@mariozechner/pi-ai";
 import type { ModelRegistry } from "@mariozechner/pi-coding-agent";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -137,7 +137,7 @@ export async function write(
   signal?.addEventListener("abort", onParent, { once: true });
 
   try {
-    const response = await complete(
+    const response = await completeSimple(
       resolved.model,
       {
         systemPrompt: WRITE_SYSTEM_PROMPT,
@@ -152,6 +152,7 @@ export async function write(
         headers: resolved.headers,
         signal: ac.signal,
         maxTokens: 32768,
+        ...(config.reasoning !== "off" ? { reasoning: config.reasoning } : {}),
       },
     );
 
