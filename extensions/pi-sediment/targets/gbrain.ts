@@ -1,7 +1,8 @@
 /**
  * pi-sediment gbrain target — write to gbrain via CLI.
  *
- * Uses `gbrain put <slug> --title <title> --tags <tags>` with content on stdin.
+ * Uses `gbrain put <slug> --content <frontmatter+body>` to avoid
+ * Bun's /dev/stdin reliability issues in headless/pipe environments.
  * Throttle/rate-limit → silent downgrade (deferred).
  * gbrain unavailable → silent skip.
  */
@@ -10,8 +11,13 @@ import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { sanitizeSlug } from "../utils.js";
+import { isNonLatin, sanitizeSlug } from "../utils.js";
 import type { GbrainEntry } from "../types.js";
+
+// ── Constants ─────────────────────────────────────────────────
+
+/** Be defensive about ARG_MAX; cap content at 96 KB. */
+const MAX_CONTENT_BYTES = 96 * 1024;
 
 // ── Helpers ────────────────────────────────────────────────────
 
@@ -28,34 +34,118 @@ function logLine(projectRoot: string, line: string): void {
   } catch { /* silent */ }
 }
 
-// ── Public ─────────────────────────────────────────────────────
+/** Wrap body content with minimal YAML frontmatter (gbrain --content requires it). */
+function wrapFrontmatter(entry: GbrainEntry): string {
+  const tags = entry.tags.map((t) => JSON.stringify(t)).join(", ");
+  return [
+    "---",
+    `title: ${JSON.stringify(entry.title)}`,
+    `tags: [${tags}]`,
+    "---",
+    "",
+    entry.content,
+  ].join("\n");
+}
+
+// ── Retry ──────────────────────────────────────────────────────
+
+/**
+ * Callback for regenerating a gbrain entry (e.g. translating to English).
+ * Called when first write fails and content is predominantly non-Latin.
+ */
+export type GbrainTranslateFn = (
+  entry: GbrainEntry,
+  attempt: number,
+) => Promise<GbrainEntry | null>;
+
+/**
+ * Write to gbrain with retry logic.
+ *
+ * Strategy:
+ *   Attempt 1: write original entry
+ *   If failed + non-Latin content + translateFn available:
+ *     Attempt 2-3: call translateFn, write translated entry (1s / 2s backoff)
+ *   If failed + Latin content (or no translateFn):
+ *     Attempt 2-3: retry original entry with backoff (1s / 2s)
+ *
+ * Returns true if any attempt succeeded.
+ */
+export async function writeToGbrainWithRetry(
+  entry: GbrainEntry,
+  projectRoot: string,
+  translateFn?: GbrainTranslateFn,
+  maxAttempts: number = 3,
+): Promise<boolean> {
+  // Attempt 1: original
+  const firstOk = await writeToGbrain(entry, projectRoot);
+  if (firstOk) return true;
+
+  const needsTranslate =
+    translateFn &&
+    (isNonLatin(entry.title) || isNonLatin(entry.content));
+
+  let current = entry;
+
+  for (let attempt = 2; attempt <= maxAttempts; attempt++) {
+    const delayMs = 1000 * (attempt - 1);
+    await sleep(delayMs);
+
+    if (needsTranslate) {
+      const translated = await translateFn(current, attempt);
+      if (translated) {
+        current = translated;
+        logLine(projectRoot, `gbrain retry:translated attempt=${attempt} slug=${sanitizeSlug(current.title)}`);
+      } else {
+        logLine(projectRoot, `gbrain retry:translate_failed attempt=${attempt}`);
+        continue;
+      }
+    }
+
+    const ok = await writeToGbrain(current, projectRoot);
+    if (ok) {
+      logLine(projectRoot, `gbrain retry:ok attempt=${attempt}`);
+      return true;
+    }
+  }
+
+  logLine(projectRoot, `gbrain retry:exhausted attempts=${maxAttempts}`);
+  return false;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+// ── Public (bare) ───────────────────────────────────────────────
 
 export async function writeToGbrain(
   entry: GbrainEntry,
   projectRoot: string,
 ): Promise<boolean> {
   const slug = sanitizeSlug(entry.title);
-  if (!slug) return false;
+  if (!slug) {
+    logLine(projectRoot, `gbrain write:skip slug=empty title="${entry.title.slice(0, 80)}"`);
+    return false;
+  }
+
+  const fullContent = wrapFrontmatter(entry);
+  const contentBytes = Buffer.byteLength(fullContent, "utf8");
+
+  // Guard against ARG_MAX on platforms with low limits.
+  if (contentBytes > MAX_CONTENT_BYTES) {
+    logLine(projectRoot, `gbrain write:skip slug=${slug} reason=content_too_large bytes=${contentBytes}`);
+    return false;
+  }
 
   const args = [
     "put", slug,
     "--title", entry.title,
     "--tags", entry.tags.join(","),
+    "--content", fullContent,
   ];
 
-  // Write content to temp file — gbrain's Bun runtime has stdin issues
-  // when spawned from Node.js (ENXIO: open '/dev/stdin').
-  let tmpPath = "";
-  try {
-    tmpPath = path.join(os.tmpdir(), `pi-sediment-gbrain-${slug}.md`);
-    fs.writeFileSync(tmpPath, entry.content, "utf8");
-  } catch (e: any) {
-    logLine(projectRoot, `gbrain write:tmpfail slug=${slug} ${e.message}`);
-    return false;
-  }
-
   return new Promise((resolve) => {
-    const child = spawn("bash", ["-c", `cat ${JSON.stringify(tmpPath)} | gbrain ${args.map(a => JSON.stringify(a)).join(" ")}; rm -f ${JSON.stringify(tmpPath)}`], {
+    const child = spawn("gbrain", args, {
       cwd: path.join(os.homedir(), "gbrain"),
       stdio: ["ignore", "pipe", "pipe"],
     });

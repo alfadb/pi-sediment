@@ -9,7 +9,9 @@
  * Worker (detached async, sequential):
  *   evaluate → skip → next
  *   evaluate → sediment → write (single call, dual output)
- *     → Promise.all([writeToPensieve, writeToGbrain]) → next
+ *     → Promise.all([writeToPensieve, writeToGbrainWithRetry]) → next
+ *     gbrain failures trigger up to 2 retries; non-Latin content gets
+ *     LLM-translated to English before retry
  *
  * Key design:
  *   - No regex pre-filtering — model decides everything
@@ -31,7 +33,9 @@ import { enqueue, startWorker, clearSession } from "./queue.js";
 import { evaluate } from "./evaluator.js";
 import { write } from "./writer.js";
 import { writeToPensieve } from "./targets/pensieve.js";
-import { writeToGbrain } from "./targets/gbrain.js";
+import { writeToGbrainWithRetry, type GbrainTranslateFn } from "./targets/gbrain.js";
+import { loadConfig } from "./config.js";
+import { complete } from "@mariozechner/pi-ai";
 import type { QueueItem, TargetStatus } from "./types.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -66,6 +70,85 @@ function formatStatus(targets: TargetStatus): string {
   if (targets.gbrain) parts.push("gbrain");
   if (parts.length === 0) return "⏳ sediment: no targets";
   return `⏳ sediment → ${parts.join("+")}`;
+}
+
+// ── gbrain translation ─────────────────────────────────────────
+
+const TRANSLATE_SYSTEM_PROMPT = `You are a technical translator. Your ONLY job is to translate the given technical content to English.
+
+Rules:
+- Preserve ALL technical accuracy, terms, and code references
+- Keep the same structure (sections, lists, etc.)
+- Output ONLY the translated content, no preamble or commentary
+- Both the title and body must be in English`;
+
+async function translateGbrainEntry(
+  entry: { title: string; tags: string[]; content: string },
+  projectRoot: string,
+  registry: any,
+): Promise<{ title: string; tags: string[]; content: string } | null> {
+  const config = loadConfig(projectRoot);
+  const model = registry.find(config.model.provider, config.model.modelId);
+  if (!model) return null;
+
+  const auth = await registry.getApiKeyAndHeaders(model);
+  if (!auth.ok || !auth.apiKey) return null;
+
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(new Error("timeout")), 30_000);
+
+  try {
+    const prompt = [
+      "Translate the following technical content to English.",
+      "",
+      `Title: ${entry.title}`,
+      "",
+      "Body:",
+      entry.content,
+    ].join("\n");
+
+    const response = await complete(
+      model,
+      {
+        systemPrompt: TRANSLATE_SYSTEM_PROMPT,
+        messages: [{
+          role: "user",
+          content: [{ type: "text", text: prompt }],
+          timestamp: Date.now(),
+        }],
+      },
+      {
+        apiKey: auth.apiKey,
+        headers: auth.headers,
+        signal: ac.signal,
+        maxTokens: 8192,
+      },
+    );
+
+    if (response.stopReason !== "complete") return null;
+
+    const text = response.content
+      .filter((c: any) => c.type === "text")
+      .map((c: any) => c.text)
+      .join("\n");
+
+    // Parse: first line is title, rest is body
+    const lines = text.trim().split("\n");
+    const engTitle = lines[0]?.replace(/^#+\s*/, "").trim();
+    const engBody = lines.slice(1).join("\n").trim();
+
+    if (!engTitle || !engBody) return null;
+
+    return {
+      title: engTitle.slice(0, 200),
+      tags: entry.tags,
+      content: engBody,
+    };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 // ── Worker callback ────────────────────────────────────────────
@@ -103,13 +186,18 @@ async function processItem(item: QueueItem, ctx: any): Promise<void> {
     return;
   }
 
-  // 3. Write to targets — parallel, both must complete
+  // 3. Build translate callback (for non-Latin gbrain content that fails)
+  const translateFn: GbrainTranslateFn = writeResult.gbrain
+    ? async (entry, attempt) => translateGbrainEntry(entry, item.projectRoot, ctx.modelRegistry)
+    : async () => null;
+
+  // 4. Write to targets — parallel, both must complete
   const results = await Promise.all([
     writeResult.pensieve && item.targets.pensieve
       ? writeToPensieve(writeResult.pensieve, item.projectRoot).then((ok) => ({ target: "pensieve" as const, ok, label: writeResult.pensieve!.label }))
       : Promise.resolve(null),
     writeResult.gbrain && item.targets.gbrain
-      ? writeToGbrain(writeResult.gbrain, item.projectRoot).then((ok) => ({ target: "gbrain" as const, ok, label: writeResult.gbrain!.title }))
+      ? writeToGbrainWithRetry(writeResult.gbrain, item.projectRoot, translateFn).then((ok) => ({ target: "gbrain" as const, ok, label: writeResult.gbrain!.title }))
       : Promise.resolve(null),
   ]);
 
