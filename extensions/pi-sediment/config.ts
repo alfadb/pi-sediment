@@ -77,7 +77,7 @@ export function loadConfig(projectRoot: string): SedimentConfig {
     model,
     reasoning,
     evalTimeoutMs: 30_000,
-    writeTimeoutMs: 90_000,
+    writeTimeoutMs: 300_000,
   };
 }
 
