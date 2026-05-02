@@ -238,6 +238,7 @@ async function processItem(item: QueueItem, ctx: any): Promise<void> {
 export default function piSediment(pi: ExtensionAPI) {
   let targets: TargetStatus = { pensieve: false, gbrain: false, gbrainPageCount: null };
   const sessionStates = new Map<string, { targets: TargetStatus; cwd: string }>();
+  const sessionAbortControllers = new Map<string, AbortController>();
 
   // ── session_start: detect targets ──────────────────────────
   pi.on("session_start", async (_event: SessionStartEvent, ctx) => {
@@ -267,6 +268,12 @@ export default function piSediment(pi: ExtensionAPI) {
   // ── session_shutdown: cleanup ────────────────────────────
   pi.on("session_shutdown", (_event: SessionShutdownEvent, ctx) => {
     const sid = ctx.sessionManager.getSessionFile?.() ?? "ephemeral";
+    // Abort in-progress sediment work for this session
+    const ctrl = sessionAbortControllers.get(sid);
+    if (ctrl) {
+      ctrl.abort();
+      sessionAbortControllers.delete(sid);
+    }
     clearSession(sid);
     sessionStates.delete(sid);
   });
@@ -277,6 +284,15 @@ export default function piSediment(pi: ExtensionAPI) {
 
     const sid = ctx.sessionManager.getSessionFile?.() ?? "ephemeral";
     const cwd = ctx.cwd;
+
+    // Get or create a dedicated abort controller for this session's sediment.
+    // Do NOT reuse ctx.signal — it gets aborted on next agent turn, which
+    // would kill in-progress sediment writes.
+    let ctrl = sessionAbortControllers.get(sid);
+    if (!ctrl || ctrl.signal.aborted) {
+      ctrl = new AbortController();
+      sessionAbortControllers.set(sid, ctrl);
+    }
 
     // Extract last assistant message
     const branch = ctx.sessionManager.getBranch();
@@ -293,7 +309,7 @@ export default function piSediment(pi: ExtensionAPI) {
       projectRoot: cwd,
       targets: { ...targets },
       cwd,
-      signal: ctx.signal,
+      signal: ctrl.signal,
     };
 
     enqueue(sid, item);

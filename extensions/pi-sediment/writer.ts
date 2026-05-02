@@ -25,10 +25,15 @@ async function resolveModel(
   return { model: m, apiKey: auth.apiKey, headers: auth.headers, display: formatModelRef(config.model) };
 }
 
-function extractWriteOutput(text: string): WriterOutput | null {
+function extractWriteOutput(text: string, projectRoot: string): WriterOutput | null {
   // Strip outer code fences if present (model sometimes wraps output)
   let clean = text.trim();
-  const fenceMatch = clean.match(/^```(?:markdown|md)?\s*\n([\s\S]*?)\n```\s*$/);
+  // Try full-document fence first
+  let fenceMatch = clean.match(/^```(?:markdown|md)?\s*\n([\s\S]*?)\n```\s*$/);
+  if (!fenceMatch) {
+    // Try without language tag
+    fenceMatch = clean.match(/^```\s*\n([\s\S]*?)\n```\s*$/);
+  }
   if (fenceMatch) clean = fenceMatch[1];
 
   const pensieveRaw = extractSection(clean, "PENSIEVE");
@@ -37,34 +42,45 @@ function extractWriteOutput(text: string): WriterOutput | null {
   const pensieve = pensieveRaw ? parsePensieveSection(pensieveRaw) : null;
   const gbrain = gbrainRaw ? parseGbrainSection(gbrainRaw) : null;
 
-  if (!pensieve && !gbrain) return null;
+  if (!pensieve && !gbrain) {
+    // Save raw output for debugging parse failures
+    saveParseFailure(clean, projectRoot);
+    return null;
+  }
   return { pensieve, gbrain };
 }
 
 function extractSection(text: string, name: string): string | null {
-  // Match markdown header: ## NAME or ## NAME (with trailing text)
-  const headerRegex = new RegExp(`^##\\s+${name}\\s*$`, "mi");
+  // Match markdown header: ## NAME or ### NAME, case-insensitive name
+  const headerRegex = new RegExp(`^#{2,3}\\s+${name}\\s*$`, "mi");
   const match = text.match(headerRegex);
   if (!match || match.index === undefined) return null;
 
   const bodyStart = match.index + match[0].length;
-  // Find the next ## header as boundary
-  const nextHeader = text.slice(bodyStart).match(/^##\s+/m);
+  // Find the next ## or ### header as boundary
+  const nextHeader = text.slice(bodyStart).match(/^#{2,3}\s+/m);
   const bodyEnd = nextHeader && nextHeader.index !== undefined
     ? bodyStart + nextHeader.index
     : text.length;
 
   const body = text.slice(bodyStart, bodyEnd).trim();
-  if (!body || body === "NULL") return null;
+  if (!body || /^NULL\s*$/i.test(body)) return null;
   return body;
 }
 
 function parsePensieveSection(raw: string): WriterOutput["pensieve"] {
-  const parts = raw.split("__CONTENT__");
-  const header = parts[0]?.trim() ?? "";
-  const content = parts.slice(1).join("__CONTENT__").trim();
+  // Split on __CONTENT__ (case-insensitive, tolerate variations)
+  const contentIdx = raw.search(/__CONTENT__/i);
+  if (contentIdx === -1) return null;
 
-  if (!content || content.length < 300) return null;
+  const header = raw.slice(0, contentIdx).trim();
+  let content = raw.slice(contentIdx + "__CONTENT__".length).trim();
+
+  if (!content || content.length < 100) return null;
+
+  // Model may add an extra blank line before frontmatter; skip it
+  content = content.replace(/^\n+/, "");
+
   // Validate Pensieve frontmatter
   if (!content.startsWith("---")) return null;
   if (!/^type:\s*(knowledge|decision|maxim)/m.test(content)) return null;
@@ -81,11 +97,14 @@ function parsePensieveSection(raw: string): WriterOutput["pensieve"] {
 }
 
 function parseGbrainSection(raw: string): WriterOutput["gbrain"] {
-  const parts = raw.split("__CONTENT__");
-  const header = parts[0]?.trim() ?? "";
-  const content = parts.slice(1).join("__CONTENT__").trim();
+  // Split on __CONTENT__ (case-insensitive)
+  const contentIdx = raw.search(/__CONTENT__/i);
+  if (contentIdx === -1) return null;
 
-  if (!content || content.length < 300) return null;
+  const header = raw.slice(0, contentIdx).trim();
+  const content = raw.slice(contentIdx + "__CONTENT__".length).trim();
+
+  if (!content || content.length < 100) return null;
 
   const title = extractField(header, "title");
   if (!title) return null;
@@ -108,6 +127,18 @@ function logLine(projectRoot: string, line: string): void {
     const dir = path.join(projectRoot, ".pi-sediment");
     fs.mkdirSync(dir, { recursive: true });
     fs.appendFileSync(path.join(dir, "sidecar.log"), `${new Date().toISOString()} ${line}\n`);
+  } catch { /* silent */ }
+}
+
+/** Save raw LLM output on parse failure for debugging. */
+function saveParseFailure(raw: string, projectRoot: string): void {
+  try {
+    const dir = path.join(projectRoot, ".pi-sediment", "parse-failures");
+    fs.mkdirSync(dir, { recursive: true });
+    const ts = new Date().toISOString().replace(/[:.]/g, "-");
+    const file = path.join(dir, `${ts}.md`);
+    fs.writeFileSync(file, raw, "utf8");
+    logLine(projectRoot, `writer parse:fail saved=${file}`);
   } catch { /* silent */ }
 }
 
@@ -170,7 +201,7 @@ export async function write(
       .map((c) => c.text)
       .join("\n");
 
-    const result = extractWriteOutput(text);
+    const result = extractWriteOutput(text, projectRoot);
     if (!result) {
       logLine(projectRoot, `${tag} parse:fail rawlen=${text.length}`);
       return { pensieve: null, gbrain: null };
