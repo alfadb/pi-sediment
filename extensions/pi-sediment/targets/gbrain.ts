@@ -1,5 +1,5 @@
 /**
- * pi-sediment gbrain target — write to gbrain via CLI.
+ * pi-sediment gbrain target — write to gbrain via CLI, search for related pages.
  *
  * Uses `gbrain put <slug> --content <frontmatter+body>` to avoid
  * Bun's /dev/stdin reliability issues in headless/pipe environments.
@@ -7,12 +7,15 @@
  * gbrain unavailable → silent skip.
  */
 
-import { spawn } from "node:child_process";
+import { spawn, execFile } from "node:child_process";
+import { promisify } from "node:util";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { isNonLatin, sanitizeSlug } from "../utils.js";
-import type { GbrainEntry } from "../types.js";
+import type { GbrainWriteOutput, GbrainSearchResult } from "../types.js";
+
+const execFileP = promisify(execFile);
 
 // ── Constants ─────────────────────────────────────────────────
 
@@ -35,7 +38,7 @@ function logLine(projectRoot: string, line: string): void {
 }
 
 /** Wrap body content with minimal YAML frontmatter (gbrain --content requires it). */
-function wrapFrontmatter(entry: GbrainEntry): string {
+function wrapFrontmatter(entry: GbrainWriteOutput): string {
   const tags = entry.tags.map((t) => JSON.stringify(t)).join(", ");
   return [
     "---",
@@ -54,9 +57,9 @@ function wrapFrontmatter(entry: GbrainEntry): string {
  * Called when first write fails and content is predominantly non-Latin.
  */
 export type GbrainTranslateFn = (
-  entry: GbrainEntry,
+  entry: GbrainWriteOutput,
   attempt: number,
-) => Promise<GbrainEntry | null>;
+) => Promise<GbrainWriteOutput | null>;
 
 /**
  * Write to gbrain with retry logic.
@@ -71,7 +74,7 @@ export type GbrainTranslateFn = (
  * Returns true if any attempt succeeded.
  */
 export async function writeToGbrainWithRetry(
-  entry: GbrainEntry,
+  entry: GbrainWriteOutput,
   projectRoot: string,
   translateFn?: GbrainTranslateFn,
   maxAttempts: number = 3,
@@ -119,7 +122,7 @@ function sleep(ms: number): Promise<void> {
 // ── Public (bare) ───────────────────────────────────────────────
 
 export async function writeToGbrain(
-  entry: GbrainEntry,
+  entry: GbrainWriteOutput,
   projectRoot: string,
 ): Promise<boolean> {
   const slug = sanitizeSlug(entry.title);
@@ -180,4 +183,71 @@ export async function writeToGbrain(
       }
     });
   });
+}
+
+// ── gbrain search ───────────────────────────────────────────────
+
+/** Extract keywords for gbrain search from the summary. */
+function extractKeywords(summary: string): string {
+  // Take meaningful words, skip common stop words and punctuation
+  const stopWords = new Set([
+    "the", "a", "an", "is", "are", "was", "were", "be", "been",
+    "being", "have", "has", "had", "do", "does", "did", "will",
+    "would", "could", "should", "may", "might", "can", "shall",
+    "to", "of", "in", "for", "on", "with", "at", "by", "from",
+    "as", "into", "through", "during", "before", "after", "and",
+    "but", "or", "not", "no", "this", "that", "it", "its",
+  ]);
+  const words = summary
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, " ")
+    .split(/\s+/)
+    .filter((w) => w.length > 2 && !stopWords.has(w));
+  // Take up to 5 most distinctive words
+  return words.slice(0, 5).join(" ");
+}
+
+/**
+ * Search gbrain for pages related to the insight summary.
+ * Used to provide the writer LLM with existing pages for [[wikilink]] cross-references.
+ */
+export async function searchGbrainForLinks(
+  summary: string,
+  projectRoot: string,
+): Promise<GbrainSearchResult[]> {
+  const query = extractKeywords(summary);
+  if (!query) return [];
+
+  try {
+    const { stdout } = await execFileP(
+      "gbrain",
+      ["search", query, "--limit", "5"],
+      {
+        timeout: 10_000,
+        maxBuffer: 256 * 1024,
+        cwd: path.join(os.homedir(), "gbrain"),
+      },
+    );
+    if (!stdout) return [];
+
+    // Parse gbrain search output: "[score] slug -- title..."
+    const results: GbrainSearchResult[] = [];
+    const lines = stdout.trim().split("\n");
+    for (const line of lines) {
+      // Format: [0.1234] slug-name -- Title: description text
+      const match = line.match(/^\[?[\d.]+\]?\s+(\S+)\s+--\s+(.+)$/);
+      if (match) {
+        results.push({
+          slug: match[1],
+          title: match[2].slice(0, 100),
+          snippet: match[2].slice(0, 200),
+        });
+      }
+    }
+
+    return results.filter((r) => r.slug).slice(0, 5);
+  } catch {
+    // gbrain search unavailable → no related pages
+    return [];
+  }
 }

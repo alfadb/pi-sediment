@@ -1,5 +1,9 @@
 /**
- * pi-sediment writer — single model call produces Pensieve + gbrain dual output.
+ * pi-sediment gbrain writer — single model call produces a gbrain page.
+ *
+ * Pensieve writing is delegated to /skill:pensieve self-improve.
+ * This module handles gbrain only: generates markdown with [[wikilink]]
+ * cross-references and timeline entries.
  */
 
 import { completeSimple } from "@mariozechner/pi-ai";
@@ -7,8 +11,8 @@ import type { ModelRegistry } from "@mariozechner/pi-coding-agent";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { formatModelRef, loadConfig } from "./config.js";
-import { WRITE_SYSTEM_PROMPT, buildWritePrompt } from "./prompts.js";
-import type { ResolvedModel, WriterOutput } from "./types.js";
+import { GBRAIN_WRITE_PROMPT, buildGbrainWritePrompt, sanitizeContent } from "./prompts.js";
+import type { GbrainWriteInput, GbrainWriteOutput, ResolvedModel } from "./types.js";
 
 // ── Helpers ────────────────────────────────────────────────────
 
@@ -25,85 +29,34 @@ async function resolveModel(
   return { model: m, apiKey: auth.apiKey, headers: auth.headers, display: formatModelRef(config.model) };
 }
 
-function extractWriteOutput(text: string, projectRoot: string): WriterOutput | null {
-  // Strip outer code fences if present (model sometimes wraps output)
+function extractGbrainOutput(text: string, projectRoot: string): GbrainWriteOutput | null {
   let clean = text.trim();
-  // Try full-document fence first
+  // Strip outer code fences if present
   let fenceMatch = clean.match(/^```(?:markdown|md)?\s*\n([\s\S]*?)\n```\s*$/);
   if (!fenceMatch) {
-    // Try without language tag
     fenceMatch = clean.match(/^```\s*\n([\s\S]*?)\n```\s*$/);
   }
   if (fenceMatch) clean = fenceMatch[1];
 
-  const pensieveRaw = extractSection(clean, "PENSIEVE");
-  const gbrainRaw = extractSection(clean, "GBRAIN");
-
-  const pensieve = pensieveRaw ? parsePensieveSection(pensieveRaw) : null;
-  const gbrain = gbrainRaw ? parseGbrainSection(gbrainRaw) : null;
-
-  if (!pensieve && !gbrain) {
-    // Save raw output for debugging parse failures
-    saveParseFailure(clean, projectRoot);
-    return null;
-  }
-  return { pensieve, gbrain };
-}
-
-function extractSection(text: string, name: string): string | null {
-  // Match markdown header: ## NAME or ### NAME, case-insensitive name
-  const headerRegex = new RegExp(`^#{2,3}\\s+${name}\\s*$`, "mi");
-  const match = text.match(headerRegex);
+  // Extract GBRAIN section
+  const headerRegex = /^#{2,3}\s+GBRAIN\s*$/mi;
+  const match = clean.match(headerRegex);
   if (!match || match.index === undefined) return null;
 
   const bodyStart = match.index + match[0].length;
-  // Find the next ## or ### header as boundary
-  const nextHeader = text.slice(bodyStart).match(/^#{2,3}\s+/m);
+  const nextHeader = clean.slice(bodyStart).match(/^#{2,3}\s+/m);
   const bodyEnd = nextHeader && nextHeader.index !== undefined
     ? bodyStart + nextHeader.index
-    : text.length;
+    : clean.length;
+  const raw = clean.slice(bodyStart, bodyEnd).trim();
+  if (!raw) return null;
 
-  const body = text.slice(bodyStart, bodyEnd).trim();
-  if (!body || /^NULL\s*$/i.test(body)) return null;
-  return body;
-}
-
-function parsePensieveSection(raw: string): WriterOutput["pensieve"] {
-  // Split on __CONTENT__ (case-insensitive, tolerate variations)
-  const contentIdx = raw.search(/__CONTENT__/i);
-  if (contentIdx === -1) return null;
-
-  const header = raw.slice(0, contentIdx).trim();
-  let content = raw.slice(contentIdx + "__CONTENT__".length).trim();
-
-  if (!content || content.length < 100) return null;
-
-  // Model may add an extra blank line before frontmatter; skip it
-  content = content.replace(/^\n+/, "");
-
-  // Validate Pensieve frontmatter
-  if (!content.startsWith("---")) return null;
-  if (!/^type:\s*(knowledge|decision|maxim)/m.test(content)) return null;
-
-  const kind = extractField(header, "kind") as "knowledge" | "decision" | "maxim" | null;
-  if (!kind || !["knowledge", "decision", "maxim"].includes(kind)) return null;
-
-  const slug = extractField(header, "slug");
-  if (!slug) return null;
-
-  const label = extractField(header, "label") || slug;
-
-  return { kind, slug, label, content };
-}
-
-function parseGbrainSection(raw: string): WriterOutput["gbrain"] {
-  // Split on __CONTENT__ (case-insensitive)
+  // Split on __CONTENT__
   const contentIdx = raw.search(/__CONTENT__/i);
   if (contentIdx === -1) return null;
 
   const header = raw.slice(0, contentIdx).trim();
   const content = raw.slice(contentIdx + "__CONTENT__".length).trim();
-
   if (!content || content.length < 100) return null;
 
   const title = extractField(header, "title");
@@ -112,6 +65,12 @@ function parseGbrainSection(raw: string): WriterOutput["gbrain"] {
   const tagsRaw = extractField(header, "tags");
   let tags = tagsRaw ? tagsRaw.split(",").map((t) => t.trim().toLowerCase()).filter(Boolean) : [];
   if (!tags.includes("engineering")) tags.unshift("engineering");
+
+  // Sanitize against injection
+  if (!sanitizeContent(content)) {
+    saveParseFailure(raw, projectRoot, "injection");
+    return null;
+  }
 
   return { title, tags, content };
 }
@@ -130,37 +89,33 @@ function logLine(projectRoot: string, line: string): void {
   } catch { /* silent */ }
 }
 
-/** Save raw LLM output on parse failure for debugging. */
-function saveParseFailure(raw: string, projectRoot: string): void {
+function saveParseFailure(raw: string, projectRoot: string, reason: string): void {
   try {
     const dir = path.join(projectRoot, ".pi-sediment", "parse-failures");
     fs.mkdirSync(dir, { recursive: true });
     const ts = new Date().toISOString().replace(/[:.]/g, "-");
-    const file = path.join(dir, `${ts}.md`);
+    const file = path.join(dir, `${ts}-${reason}.md`);
     fs.writeFileSync(file, raw, "utf8");
-    logLine(projectRoot, `writer parse:fail saved=${file}`);
+    logLine(projectRoot, `gbrain-writer parse:fail reason=${reason} saved=${file}`);
   } catch { /* silent */ }
 }
 
 // ── Public ─────────────────────────────────────────────────────
 
-export async function write(
-  summary: string,
-  lastAssistantMessage: string,
+export async function writeForGbrain(
+  input: GbrainWriteInput,
   projectRoot: string,
   registry: ModelRegistry,
   signal: AbortSignal | undefined,
-): Promise<WriterOutput> {
+): Promise<GbrainWriteOutput | null> {
   const config = loadConfig(projectRoot);
-  const tag = `writer`;
+  const tag = `gbrain-writer`;
 
   const resolved = await resolveModel(registry, projectRoot);
   if ("error" in resolved) {
     logLine(projectRoot, `${tag} model:error ${resolved.error}`);
-    return { pensieve: null, gbrain: null };
+    return null;
   }
-
-  const dateIso = new Date().toISOString().slice(0, 10);
 
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(new Error("timeout")), config.writeTimeoutMs);
@@ -171,10 +126,10 @@ export async function write(
     const response = await completeSimple(
       resolved.model,
       {
-        systemPrompt: WRITE_SYSTEM_PROMPT,
+        systemPrompt: GBRAIN_WRITE_PROMPT,
         messages: [{
           role: "user",
-          content: [{ type: "text", text: buildWritePrompt({ summary, lastAssistantMessage, dateIso }) }],
+          content: [{ type: "text", text: buildGbrainWritePrompt(input) }],
           timestamp: Date.now(),
         }],
       },
@@ -189,11 +144,11 @@ export async function write(
 
     if (response.stopReason === "error") {
       logLine(projectRoot, `${tag} call:error ${response.errorMessage || "unknown"}`);
-      return { pensieve: null, gbrain: null };
+      return null;
     }
     if (response.stopReason === "aborted") {
       logLine(projectRoot, `${tag} call:aborted`);
-      return { pensieve: null, gbrain: null };
+      return null;
     }
 
     const text = response.content
@@ -201,20 +156,17 @@ export async function write(
       .map((c) => c.text)
       .join("\n");
 
-    const result = extractWriteOutput(text, projectRoot);
+    const result = extractGbrainOutput(text, projectRoot);
     if (!result) {
       logLine(projectRoot, `${tag} parse:fail rawlen=${text.length}`);
-      return { pensieve: null, gbrain: null };
+      return null;
     }
 
-    const parts: string[] = [];
-    if (result.pensieve) parts.push(`pensieve:${result.pensieve.kind}/${result.pensieve.slug}`);
-    if (result.gbrain) parts.push(`gbrain:${result.gbrain.title}`);
-    logLine(projectRoot, `${tag} done: ${parts.join(" + ")}`);
+    logLine(projectRoot, `${tag} done: title="${result.title.slice(0, 80)}"`);
     return result;
   } catch (e: any) {
     logLine(projectRoot, `${tag} exception:${e?.message ?? String(e)}`);
-    return { pensieve: null, gbrain: null };
+    return null;
   } finally {
     clearTimeout(timer);
     signal?.removeEventListener("abort", onParent);

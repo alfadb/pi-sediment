@@ -15,34 +15,43 @@ export interface TargetStatus {
   gbrainPageCount: number | null;
 }
 
-// ── Evaluator I/O ──────────────────────────────────────────────
+// ── Per-target evaluator I/O ────────────────────────────────────
 
-export interface EvalResult {
+export interface GbrainEvalResult {
   decision: "skip" | "sediment";
   /** One-sentence summary of the insight (only meaningful when sediment). */
   summary: string;
 }
 
-// ── Writer I/O ─────────────────────────────────────────────────
+// ── gbrain writer I/O ───────────────────────────────────────────
 
-export interface WriterOutput {
-  /** Pensieve entry (null if insight is purely universal, no project specifics). */
-  pensieve: PensieveEntry | null;
-  /** gbrain entry (null if insight is purely project-specific). */
-  gbrain: GbrainEntry | null;
+export interface GbrainSearchResult {
+  slug: string;
+  title: string;
+  snippet: string;
 }
+
+export interface GbrainWriteInput {
+  summary: string;
+  dateIso: string;
+  lastAssistantMessage: string;
+  /** Related gbrain pages to cross-reference via [[wikilink]]. */
+  relatedPages: GbrainSearchResult[];
+}
+
+export interface GbrainWriteOutput {
+  title: string;
+  tags: string[];
+  content: string; // markdown body
+}
+
+// ── Pensieve entry (kept for reference, now written by skill) ───
 
 export interface PensieveEntry {
   kind: "maxim" | "decision" | "knowledge";
   slug: string;
   label: string;
   content: string; // full markdown with frontmatter
-}
-
-export interface GbrainEntry {
-  title: string;
-  tags: string[];
-  content: string; // markdown body
 }
 
 // ── Resolved model ─────────────────────────────────────────────

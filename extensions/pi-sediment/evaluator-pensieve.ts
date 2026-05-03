@@ -1,8 +1,11 @@
 /**
- * pi-sediment gbrain evaluator — calls model to decide skip/sediment.
+ * pi-sediment Pensieve evaluator — calls model to decide skip/sediment.
  *
- * Pensieve evaluation is delegated to /skill:pensieve self-improve.
- * This module handles gbrain only: "is this a universal engineering principle?"
+ * Evaluates whether the conversation turn contains a PROJECT-SPECIFIC insight
+ * worth saving to Pensieve (file paths, module boundaries, architectural decisions).
+ *
+ * TODO: When extension-to-skill invocation is available in pi, this will be
+ * replaced by /skill:pensieve self-improve delegation.
  */
 
 import { completeSimple } from "@mariozechner/pi-ai";
@@ -10,8 +13,49 @@ import type { ModelRegistry } from "@mariozechner/pi-coding-agent";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { formatModelRef, loadConfig, type SedimentConfig } from "./config.js";
-import { GBRAIN_EVAL_PROMPT, buildGbrainEvalPrompt } from "./prompts.js";
-import type { GbrainEvalResult, ResolvedModel, TargetStatus } from "./types.js";
+import type { ResolvedModel } from "./types.js";
+
+// ── Pensieve evaluator prompt ────────────────────────────────────
+
+const PENSIEVE_EVAL_PROMPT = `You are the pi-sediment Pensieve evaluator.
+
+Read the FINAL assistant message of a coding-agent turn and decide whether
+it contains a PROJECT-SPECIFIC insight worth saving to Pensieve.
+
+Pensieve stores project-level knowledge — file locations, module boundaries,
+call chains, architectural decisions, and project-specific conventions. Do
+NOT store universal engineering principles (those go to gbrain).
+
+Output ONLY a JSON block, nothing else:
+
+{
+  "decision": "skip" | "sediment",
+  "summary": "one sentence describing the insight (empty if skip)"
+}
+
+Sediment when:
+- An explicit architectural choice was made between alternatives
+- A bug root cause was definitively identified (symptom → root → fix chain)
+- A module boundary, call chain, or file location was discovered
+- A project-specific convention or pattern was established
+- A non-obvious pitfall specific to this codebase was found
+
+Skip when:
+- The turn is pure execution of a previously-decided plan
+- Routine implementation: formatting, renaming, dependency bumps, simple fixes
+- Status updates, asking user questions, or exploration without conclusion
+- The content is obvious or already well-known
+- The insight is a universal principle, not project-specific
+
+Be conservative. False positives pollute memory. When in doubt, skip.`;
+
+function buildPensieveEvalPrompt(lastAssistantMessage: string): string {
+  return `Evaluate this assistant message and emit the JSON decision.
+
+<assistant-message>
+${lastAssistantMessage}
+</assistant-message>`;
+}
 
 // ── Helpers ────────────────────────────────────────────────────
 
@@ -27,7 +71,12 @@ async function resolveModel(
   return { model: m, apiKey: auth.apiKey, headers: auth.headers, display: formatModelRef(config.model) };
 }
 
-function extractEvalJson(text: string): GbrainEvalResult | null {
+interface PensieveEvalResult {
+  decision: "skip" | "sediment";
+  summary: string;
+}
+
+function extractEvalJson(text: string): PensieveEvalResult | null {
   let body = text;
   const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/);
   if (fence) body = fence[1];
@@ -54,23 +103,20 @@ function logLine(projectRoot: string, line: string): void {
 
 // ── Public ─────────────────────────────────────────────────────
 
-export async function evaluateForGbrain(
+export async function evaluate(
   lastAssistantMessage: string,
-  targets: TargetStatus,
   projectRoot: string,
   registry: ModelRegistry,
   signal: AbortSignal | undefined,
-): Promise<GbrainEvalResult> {
+): Promise<PensieveEvalResult> {
   const config = loadConfig(projectRoot);
-  const tag = `gbrain-evaluator`;
+  const tag = `pensieve-evaluator`;
 
   const resolved = await resolveModel(config, registry);
   if ("error" in resolved) {
     logLine(projectRoot, `${tag} model:error ${resolved.error}`);
     return { decision: "skip", summary: "" };
   }
-
-  const gbrainColdStart = targets.gbrain && (targets.gbrainPageCount ?? 999) < 10;
 
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(new Error("timeout")), config.evalTimeoutMs);
@@ -81,10 +127,10 @@ export async function evaluateForGbrain(
     const response = await completeSimple(
       resolved.model,
       {
-        systemPrompt: GBRAIN_EVAL_PROMPT,
+        systemPrompt: PENSIEVE_EVAL_PROMPT,
         messages: [{
           role: "user",
-          content: [{ type: "text", text: buildGbrainEvalPrompt({ lastAssistantMessage, gbrainColdStart }) }],
+          content: [{ type: "text", text: buildPensieveEvalPrompt(lastAssistantMessage) }],
           timestamp: Date.now(),
         }],
       },

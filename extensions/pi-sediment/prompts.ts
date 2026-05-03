@@ -1,43 +1,72 @@
 /**
- * pi-sediment prompts — evaluator + writer.
+ * pi-sediment prompts — per-target evaluator + writer.
  *
- * Two stages, two prompts:
- *   EVAL  → decide skip/sediment + one-line summary
- *   WRITE → produce Pensieve + gbrain markdown (dual output, single call)
- *
- * Cold-start hint: appended when gbrain has < 10 pages.
+ * Pensieve: delegated to /skill:pensieve self-improve (no custom prompt needed).
+ * gbrain:   dedicated evaluator + writer with wikilinks and timeline support.
  */
 
-// ── Evaluator ──────────────────────────────────────────────────
+import type { GbrainSearchResult } from "./types.js";
 
-export const EVAL_SYSTEM_PROMPT = `You are the pi-sediment evaluator.
+// ── Injection filter patterns (from gstack) ─────────────────────
+
+export const INJECTION_PATTERNS: RegExp[] = [
+  /ignore\s+(all\s+)?previous\s+(instructions|context|rules)/i,
+  /you\s+are\s+now\s+/i,
+  /always\s+output\s+no\s+findings/i,
+  /skip\s+(all\s+)?(security|review|checks)/i,
+  /override[:\s]/i,
+  /\bsystem\s*:/i,
+  /\bassistant\s*:/i,
+  /\buser\s*:/i,
+  /do\s+not\s+(report|flag|mention)/i,
+  /approve\s+(all|every|this)/i,
+];
+
+/**
+ * Sanitize LLM-generated content against prompt injection patterns.
+ * Returns null if a pattern matches (content rejected).
+ */
+export function sanitizeContent(content: string): string | null {
+  for (const pat of INJECTION_PATTERNS) {
+    if (pat.test(content)) return null;
+  }
+  return content;
+}
+
+// ── gbrain evaluator ────────────────────────────────────────────
+
+export const GBRAIN_EVAL_PROMPT = `You are the pi-sediment gbrain evaluator.
 
 Read the FINAL assistant message of a coding-agent turn and decide whether
-it contains a durable engineering insight worth saving.
+it contains a UNIVERSAL engineering principle worth saving to gbrain.
+
+gbrain stores cross-project knowledge — patterns, anti-patterns, principles,
+and pitfalls that apply beyond the current codebase. Do NOT store
+project-specific details (file paths, module names, repo conventions).
 
 Output ONLY a JSON block, nothing else:
 
 {
   "decision": "skip" | "sediment",
-  "summary": "one sentence describing the insight (empty if skip)"
+  "summary": "one-sentence principle (empty if skip)"
 }
 
 Sediment when:
-- An explicit architectural choice was made between alternatives
-- A bug root cause was definitively identified (symptom → root → fix chain)
-- A non-obvious pattern, anti-pattern, or pitfall was discovered
-- An exploration produced reusable knowledge (call chain, module boundary, constraint)
-- A design tradeoff was settled with reasoning
+- A bug root cause reveals a pattern others would hit
+- An architectural tradeoff settles a general design question
+- A non-obvious pitfall or anti-pattern is discovered
+- An API/library behavior is documented with a workaround
+- A cross-cutting engineering principle is articulated
 
 Skip when:
-- The turn is pure execution of a previously-decided plan
-- Routine implementation: formatting, renaming, dependency bumps, simple fixes
-- Status updates, asking user questions, or exploration without conclusion
+- The insight is project-specific (file paths, internal module names)
+- The turn is routine execution (formatting, renaming, dependency bumps)
 - The content is obvious or already well-known
+- Status updates, user questions, or exploration without conclusion
 
 Be conservative. False positives pollute memory. When in doubt, skip.`;
 
-export function buildEvalPrompt(args: {
+export function buildGbrainEvalPrompt(args: {
   lastAssistantMessage: string;
   gbrainColdStart: boolean;
 }): string {
@@ -55,52 +84,65 @@ ${args.lastAssistantMessage}
 </assistant-message>`;
 }
 
-// ── Writer ─────────────────────────────────────────────────────
+// ── gbrain writer ───────────────────────────────────────────────
 
-export const WRITE_SYSTEM_PROMPT = `You are the pi-sediment writer.
+export const GBRAIN_WRITE_PROMPT = `You are the pi-sediment gbrain writer.
 
-Given an engineering insight, produce TWO outputs using markdown sections.
+Given an engineering insight, produce a gbrain page: a universal principle
+distilled from the source material. The output must be self-contained and
+readable without referencing the original conversation.
 
-Format:
+Output format:
 
-## PENSIEVE
-kind: knowledge
-slug: lowercase-hyphenated-slug
-label: <= 60 char headline
+## GBRAIN
+title: <= 100 char headline (present-tense imperative, e.g. "Verify Connectivity By Performing A Real Operation")
+tags: engineering, relevant-topic-1, relevant-topic-2
 __CONTENT__
----
-type: knowledge
-id: slug
-status: active
-created: YYYY-MM-DD
-tags: [tag1, tag2]
----
+Full markdown body with these sections:
 
 # Title
 
-Body content with file paths, module names, project specifics...
+## Principle
+One sentence stating the principle.
 
-## GBRAIN
-title: headline
-tags: engineering, pattern-name
-__CONTENT__
-full markdown body (universal principle, no file paths)
+## Guidance
+- 3-5 actionable guidelines
 
-If an output is not applicable, write ONLY the word NULL under its header:
+## When this applies
+- Scenarios where this principle helps
 
-## PENSIEVE
-NULL
+## Boundaries
+- When NOT to apply this (important — prevents overgeneralization)
+
+## Timeline
+- **{date}** | pi-sediment — One-line summary of when this insight was captured
 
 RULES:
-- Pensieve answers "how to fix it HERE" (project-specific file paths, modules)
-- gbrain answers "how to avoid it EVERYWHERE" (distilled principle)
-- Content MUST be different between the two`;
+- Title must be in present-tense imperative form
+- Content must contain NO file paths, NO module names, NO project specifics
+- When referencing related engineering principles that exist as brain pages,
+  use [[exact-slug]] wikilink syntax (see the list of related pages provided
+  in the prompt for available slugs)
+- The Timeline section MUST be included with the date provided
+- Tags must include at least one specific topic tag beyond "engineering"
+- Body must be >= 200 words of original synthesis, not a copy-paste`;
 
-export function buildWritePrompt(args: {
+export function buildGbrainWritePrompt(args: {
   summary: string;
-  lastAssistantMessage: string;
   dateIso: string;
+  lastAssistantMessage: string;
+  relatedPages: GbrainSearchResult[];
 }): string {
+  let relatedSection = "";
+  if (args.relatedPages.length > 0) {
+    const lines = args.relatedPages.map(
+      (p) => `- [[${p.slug}]]: ${p.title}`
+    );
+    relatedSection =
+      "\n\nExisting related pages in gbrain (use these slugs when adding [[wikilink]] references):\n" +
+      lines.join("\n");
+  }
+
   return `Insight summary: ${args.summary}
 
 Date: ${args.dateIso}
@@ -109,7 +151,7 @@ Source material (full assistant message):
 
 <source>
 ${args.lastAssistantMessage}
-</source>
+</source>${relatedSection}
 
-Produce the Pensieve and gbrain entries using the markdown section format above.`;
+Produce the gbrain entry using the markdown section format above.`;
 }

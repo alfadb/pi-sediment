@@ -1,24 +1,28 @@
 /**
- * pi-sediment extension — unified auto-sediment engine.
+ * pi-sediment extension — per-target auto-sediment engine.
  *
  * Lifecycle:
  *   session_start  → detect targets (Pensieve + gbrain), update status bar
  *   before_agent_start → re-detect targets (gbrain may come online mid-session)
  *   agent_end      → push last_assistant_message to queue (non-blocking)
  *
- * Worker (detached async, sequential):
- *   evaluate → skip → next
- *   evaluate → sediment → write (single call, dual output)
- *     → Promise.all([writeToPensieve, writeToGbrainWithRetry]) → next
- *     gbrain failures trigger up to 2 retries; non-Latin content gets
- *     LLM-translated to English before retry
+ * Worker (detached async, parallel per-target pipelines):
+ *
+ *   Pensieve pipeline:
+ *     evaluator (Pensieve criteria) → writer → writeToPensieve
+ *
+ *   gbrain pipeline:
+ *     evaluateForGbrain → searchGbrainForLinks → writeForGbrain (with wikilinks + timeline) → gbrain put
  *
  * Key design:
- *   - No regex pre-filtering — model decides everything
+ *   - Per-target evaluation — each target decides independently
+ *   - gbrain writer includes [[wikilink]] cross-references and timeline entries
+ *   - Injection filter on all LLM-generated content
  *   - In-process sidecar — 0 token / 0 latency / 0 context pollution
  *   - Queue max 20 — prevents memory leaks, drops oldest when full
- *   - Cold-start hint — gbrain < 10 pages → evaluator more aggressive
- *   - Both writes must complete before consuming next queue item
+ *
+ * Future: Pensieve will delegate to /skill:pensieve self-improve once extension-to-skill
+ * invocation is available. For now, Pensieve keeps its internal evaluator+writer.
  */
 
 import type {
@@ -30,13 +34,13 @@ import type {
 
 import { detectTargets } from "./detector.js";
 import { enqueue, startWorker, clearSession } from "./queue.js";
-import { evaluate } from "./evaluator.js";
-import { write } from "./writer.js";
+import { evaluateForGbrain } from "./evaluator.js";
+import { writeForGbrain } from "./writer.js";
+import { searchGbrainForLinks, writeToGbrainWithRetry, type GbrainTranslateFn } from "./targets/gbrain.js";
 import { writeToPensieve } from "./targets/pensieve.js";
-import { writeToGbrainWithRetry, type GbrainTranslateFn } from "./targets/gbrain.js";
 import { loadConfig } from "./config.js";
 import { completeSimple } from "@mariozechner/pi-ai";
-import type { QueueItem, TargetStatus } from "./types.js";
+import type { QueueItem, TargetStatus, GbrainWriteOutput, GbrainWriteInput } from "./types.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
@@ -72,7 +76,7 @@ function formatStatus(targets: TargetStatus): string {
   return `⏳ sediment → ${parts.join("+")}`;
 }
 
-// ── gbrain translation ─────────────────────────────────────────
+// ── gbrain translation (non-Latin → English retry) ──────────────
 
 const TRANSLATE_SYSTEM_PROMPT = `You are a technical translator. Your ONLY job is to translate the given technical content to English.
 
@@ -133,7 +137,6 @@ async function translateGbrainEntry(
       .map((c: any) => c.text)
       .join("\n");
 
-    // Parse: first line is title, rest is body
     const lines = text.trim().split("\n");
     const engTitle = lines[0]?.replace(/^#+\s*/, "").trim();
     const engBody = lines.slice(1).join("\n").trim();
@@ -152,27 +155,30 @@ async function translateGbrainEntry(
   }
 }
 
-// ── Worker callback ────────────────────────────────────────────
+// ── Pensieve pipeline (internal evaluator+writer for now) ──────
 
-async function processItem(item: QueueItem, ctx: any): Promise<void> {
-  // 1. Evaluate
+async function runPensievePipeline(
+  item: QueueItem,
+  ctx: any,
+): Promise<{ ok: boolean; label: string } | null> {
+  if (!item.targets.pensieve) return null;
+
+  // For now, keep the existing Pensieve evaluator+writer path.
+  // TODO: delegate to /skill:pensieve self-improve when extension-to-skill
+  // invocation becomes available in pi.
+  const { evaluate } = await import("./evaluator-pensieve.js");
+  const { write: writePensieveEntry } = await import("./writer-pensieve.js");
+
   const evalResult = await evaluate(
     item.lastAssistantMessage,
-    item.targets,
     item.projectRoot,
     ctx.modelRegistry,
     item.signal,
   );
 
-  if (evalResult.decision === "skip") return;
+  if (evalResult.decision === "skip") return null;
 
-  // Status: writing
-  if (ctx.hasUI) {
-    try { ctx.ui.setStatus("pi-sediment", "⏳ sediment: writing..."); } catch {}
-  }
-
-  // 2. Write (single call, dual output)
-  const writeResult = await write(
+  const writeResult = await writePensieveEntry(
     evalResult.summary,
     item.lastAssistantMessage,
     item.projectRoot,
@@ -180,26 +186,74 @@ async function processItem(item: QueueItem, ctx: any): Promise<void> {
     item.signal,
   );
 
-  if (!writeResult.pensieve && !writeResult.gbrain) {
-    if (ctx.hasUI) {
-      try { ctx.ui.setStatus("pi-sediment", formatStatus(item.targets)); } catch {}
-    }
-    return;
-  }
+  if (!writeResult) return null;
 
-  // 3. Build translate callback (for non-Latin gbrain content that fails)
-  const translateFn: GbrainTranslateFn = writeResult.gbrain
+  const ok = await writeToPensieve(writeResult, item.projectRoot);
+  return { ok, label: writeResult.label };
+}
+
+// ── gbrain pipeline (new: evaluate → search → write with wikilinks) ──
+
+async function runGbrainPipeline(
+  item: QueueItem,
+  ctx: any,
+): Promise<{ ok: boolean; label: string } | null> {
+  if (!item.targets.gbrain) return null;
+
+  // 1. Evaluate: is this a universal engineering principle?
+  const evalResult = await evaluateForGbrain(
+    item.lastAssistantMessage,
+    item.targets,
+    item.projectRoot,
+    ctx.modelRegistry,
+    item.signal,
+  );
+
+  if (evalResult.decision === "skip") return null;
+
+  // 2. Search gbrain for related pages (for [[wikilink]] cross-references)
+  const relatedPages = await searchGbrainForLinks(evalResult.summary, item.projectRoot);
+
+  // 3. Write: generate gbrain markdown with wikilinks and timeline
+  const dateIso = new Date().toISOString().slice(0, 10);
+  const writeInput: GbrainWriteInput = {
+    summary: evalResult.summary,
+    dateIso,
+    lastAssistantMessage: item.lastAssistantMessage,
+    relatedPages,
+  };
+
+  const writeResult = await writeForGbrain(
+    writeInput,
+    item.projectRoot,
+    ctx.modelRegistry,
+    item.signal,
+  );
+
+  if (!writeResult) return null;
+
+  // 4. Build translation callback for non-Latin content retry
+  const translateFn: GbrainTranslateFn = writeResult
     ? async (entry, attempt) => translateGbrainEntry(entry, item.projectRoot, ctx.modelRegistry)
     : async () => null;
 
-  // 4. Write to targets — parallel, both must complete
+  // 5. Write to gbrain (with retry + translation fallback)
+  const ok = await writeToGbrainWithRetry(writeResult, item.projectRoot, translateFn);
+  return { ok, label: writeResult.title };
+}
+
+// ── Worker callback ────────────────────────────────────────────
+
+async function processItem(item: QueueItem, ctx: any): Promise<void> {
+  // Status: evaluating
+  if (ctx.hasUI) {
+    try { ctx.ui.setStatus("pi-sediment", "⏳ sediment: evaluating..."); } catch {}
+  }
+
+  // Run Pensieve and gbrain pipelines in parallel
   const results = await Promise.all([
-    writeResult.pensieve && item.targets.pensieve
-      ? writeToPensieve(writeResult.pensieve, item.projectRoot).then((ok) => ({ target: "pensieve" as const, ok, label: writeResult.pensieve!.label }))
-      : Promise.resolve(null),
-    writeResult.gbrain && item.targets.gbrain
-      ? writeToGbrainWithRetry(writeResult.gbrain, item.projectRoot, translateFn).then((ok) => ({ target: "gbrain" as const, ok, label: writeResult.gbrain!.title }))
-      : Promise.resolve(null),
+    runPensievePipeline(item, ctx),
+    runGbrainPipeline(item, ctx),
   ]);
 
   // Log results
@@ -207,29 +261,26 @@ async function processItem(item: QueueItem, ctx: any): Promise<void> {
   for (const r of results) {
     if (!r) continue;
     const status = r.ok ? "✓" : "✗";
-    writtenParts.push(`${r.target}:${status}`);
+    writtenParts.push(`${status}`);
   }
   if (writtenParts.length > 0) {
-    logLine(item.projectRoot, `sediment done: ${writtenParts.join(" ")}`);
+    logLine(item.projectRoot, `sediment done: pensieve=${writtenParts[0] || "-"} gbrain=${writtenParts[1] || "-"}`);
   }
 
-  // Revert status bar
-  if (ctx.hasUI) {
-    try { ctx.ui.setStatus("pi-sediment", formatStatus(item.targets)); } catch {}
-  }
-
-  // 4. Notify (non-blocking, one line)
+  // Notify
   const labels: string[] = [];
-  if (writeResult.pensieve && item.targets.pensieve) {
-    labels.push(`pensieve:${writeResult.pensieve.label.slice(0, 40)}`);
-  }
-  if (writeResult.gbrain && item.targets.gbrain) {
-    labels.push(`gbrain:${writeResult.gbrain.title.slice(0, 40)}`);
+  for (const r of results) {
+    if (r) labels.push(r.label.slice(0, 40));
   }
   if (labels.length > 0 && ctx.hasUI) {
     try {
       ctx.ui.notify(`sedimented → ${labels.join(" | ")}`, "info");
     } catch { /* print mode */ }
+  }
+
+  // Revert status bar
+  if (ctx.hasUI) {
+    try { ctx.ui.setStatus("pi-sediment", formatStatus(item.targets)); } catch {}
   }
 }
 
@@ -254,7 +305,6 @@ export default function piSediment(pi: ExtensionAPI) {
   pi.on("before_agent_start", async (_event, ctx) => {
     const sid = ctx.sessionManager.getSessionFile?.() ?? "ephemeral";
     const fresh = await detectTargets(ctx.cwd);
-    // Only update if something changed (e.g., gbrain came online)
     const prev = sessionStates.get(sid);
     if (!prev || prev.targets.gbrain !== fresh.gbrain || prev.targets.pensieve !== fresh.pensieve) {
       targets = fresh;
@@ -268,7 +318,6 @@ export default function piSediment(pi: ExtensionAPI) {
   // ── session_shutdown: cleanup ────────────────────────────
   pi.on("session_shutdown", (_event: SessionShutdownEvent, ctx) => {
     const sid = ctx.sessionManager.getSessionFile?.() ?? "ephemeral";
-    // Abort in-progress sediment work for this session
     const ctrl = sessionAbortControllers.get(sid);
     if (ctrl) {
       ctrl.abort();
@@ -285,9 +334,6 @@ export default function piSediment(pi: ExtensionAPI) {
     const sid = ctx.sessionManager.getSessionFile?.() ?? "ephemeral";
     const cwd = ctx.cwd;
 
-    // Get or create a dedicated abort controller for this session's sediment.
-    // Do NOT reuse ctx.signal — it gets aborted on next agent turn, which
-    // would kill in-progress sediment writes.
     let ctrl = sessionAbortControllers.get(sid);
     if (!ctrl || ctrl.signal.aborted) {
       ctrl = new AbortController();
@@ -314,7 +360,6 @@ export default function piSediment(pi: ExtensionAPI) {
 
     enqueue(sid, item);
 
-    // Start worker if not already running (pass ctx-like interface)
     startWorker(sid, async (qItem: QueueItem) => {
       const state = sessionStates.get(qItem.sessionId);
       if (!state) return;
