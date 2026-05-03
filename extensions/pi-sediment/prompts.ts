@@ -37,6 +37,8 @@ export function sanitizeContent(content: string): string | null {
 
 export const GBRAIN_EVAL_PROMPT = `You are the pi-sediment gbrain evaluator.
 
+ALL output MUST be in English — regardless of the source message language.
+
 Read the FINAL assistant message of a coding-agent turn and decide whether
 it contains a UNIVERSAL engineering principle worth saving to gbrain.
 
@@ -48,8 +50,11 @@ Output ONLY a JSON block, nothing else:
 
 {
   "decision": "skip" | "sediment",
-  "summary": "one-sentence principle (empty if skip)"
+  "summary": "one-sentence principle in English (empty if skip)"
 }
+
+CRITICAL: The summary field MUST be in English. Even if the source material
+is in another language, you MUST output the summary in English.
 
 Sediment when:
 - A bug root cause reveals a pattern others would hit
@@ -118,6 +123,7 @@ One sentence stating the principle.
 - **{date}** | pi-sediment — One-line summary of when this insight was captured
 
 RULES:
+- ALL output (title, tags, body, every section) MUST be in English — this is a universal knowledge base
 - Title must be in present-tense imperative form
 - Content must contain NO file paths, NO module names, NO project specifics
 - When referencing related engineering principles that exist as brain pages,

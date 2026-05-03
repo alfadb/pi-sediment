@@ -79,15 +79,31 @@ export async function writeToGbrainWithRetry(
   translateFn?: GbrainTranslateFn,
   maxAttempts: number = 3,
 ): Promise<boolean> {
-  // Attempt 1: original
-  const firstOk = await writeToGbrain(entry, projectRoot);
+  // ── Pre-write non-Latin guard ────────────────────────────
+  // gbrain is an English-only knowledge base. If the entry contains
+  // non-Latin content (e.g. Chinese title/body), translate it BEFORE
+  // the first write attempt. Otherwise the first write succeeds with
+  // non-English content and the retry translation path is never reached.
+  let current = entry;
+  if (translateFn && (isNonLatin(entry.title) || isNonLatin(entry.content))) {
+    logLine(projectRoot, `gbrain pre-translate: non-Latin detected title="${entry.title.slice(0, 60)}"`);
+    const translated = await translateFn(entry, 0);
+    if (translated) {
+      current = translated;
+      logLine(projectRoot, `gbrain pre-translate: ok title="${translated.title.slice(0, 60)}"`);
+    } else {
+      logLine(projectRoot, `gbrain pre-translate: failed, attempting raw write`);
+    }
+  }
+
+  // Attempt 1: write (possibly already translated above)
+  const firstOk = await writeToGbrain(current, projectRoot);
   if (firstOk) return true;
 
+  // If still non-Latin and first write failed, translate on retry
   const needsTranslate =
     translateFn &&
-    (isNonLatin(entry.title) || isNonLatin(entry.content));
-
-  let current = entry;
+    (isNonLatin(current.title) || isNonLatin(current.content));
 
   for (let attempt = 2; attempt <= maxAttempts; attempt++) {
     const delayMs = 1000 * (attempt - 1);
