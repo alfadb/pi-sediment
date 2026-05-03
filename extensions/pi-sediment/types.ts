@@ -35,23 +35,18 @@ export interface GbrainWriteInput {
   summary: string;
   dateIso: string;
   lastAssistantMessage: string;
-  /** Related gbrain pages to cross-reference via [[wikilink]]. */
+  /** Related gbrain pages used for frontmatter auto-link extraction. */
   relatedPages: GbrainSearchResult[];
+  /** Format error feedback for retry (undefined on first attempt). */
+  formatError?: string;
 }
 
 export interface GbrainWriteOutput {
   title: string;
   tags: string[];
   content: string; // markdown body
-}
-
-// ── Pensieve entry (kept for reference, now written by skill) ───
-
-export interface PensieveEntry {
-  kind: "maxim" | "decision" | "knowledge";
-  slug: string;
-  label: string;
-  content: string; // full markdown with frontmatter
+  /** Related page titles for gbrain frontmatter auto-link extraction. */
+  related?: string[];
 }
 
 // ── Resolved model ─────────────────────────────────────────────
@@ -61,15 +56,4 @@ export interface ResolvedModel {
   apiKey: string;
   headers?: Record<string, string>;
   display: string;
-}
-
-// ── Queue item ─────────────────────────────────────────────────
-
-export interface QueueItem {
-  sessionId: string;
-  lastAssistantMessage: string;
-  projectRoot: string;
-  targets: TargetStatus;
-  cwd: string;
-  signal: AbortSignal | undefined;
 }

@@ -1,50 +1,42 @@
 /**
- * pi-sediment extension — per-target auto-sediment engine.
+ * pi-sediment extension — automatic insight capture engine.
  *
- * Lifecycle:
- *   session_start  → detect targets (Pensieve + gbrain), update status bar
- *   before_agent_start → re-detect targets (gbrain may come online mid-session)
- *   agent_end      → push last_assistant_message to queue (non-blocking)
- *
- * Worker (detached async, parallel per-target pipelines):
- *
- *   Pensieve pipeline:
- *     evaluator (Pensieve criteria) → writer → writeToPensieve
- *
- *   gbrain pipeline:
- *     evaluateForGbrain → searchGbrainForLinks → writeForGbrain (with wikilinks + timeline) → gbrain put
- *
- * Key design:
- *   - Per-target evaluation — each target decides independently
- *   - gbrain writer includes [[wikilink]] cross-references and timeline entries
- *   - Injection filter on all LLM-generated content
- *   - In-process sidecar — 0 token / 0 latency / 0 context pollution
- *   - Queue max 20 — prevents memory leaks, drops oldest when full
- *
- * Future: Pensieve will delegate to /skill:pensieve self-improve once extension-to-skill
- * invocation is available. For now, Pensieve keeps its internal evaluator+writer.
+ * Architecture:
+ *   - agent_end only marks each target's pending head entry.
+ *   - Each target has an independent checkpoint scheduler, not a FIFO queue.
+ *   - A run evaluates the whole window from lastProcessedEntryId to pendingHeadEntryId.
+ *   - New turns arriving during a run coalesce into the next pending window.
+ *   - Workers are never interrupted by the main session; only internal timeouts apply.
  */
 
 import type {
   AgentEndEvent,
   ExtensionAPI,
-  SessionShutdownEvent,
   SessionStartEvent,
 } from "@mariozechner/pi-coding-agent";
 
 import { detectTargets } from "./detector.js";
-import { enqueue, startWorker, clearSession } from "./queue.js";
+import { registerScheduler, markPending, type RunResult, type RunWindow } from "./scheduler.js";
 import { evaluateForGbrain } from "./evaluator.js";
-import { writeForGbrain } from "./writer.js";
-import { searchGbrainForLinks, writeToGbrainWithRetry, type GbrainTranslateFn } from "./targets/gbrain.js";
-import { writeToPensieve } from "./targets/pensieve.js";
+import {
+  writeForGbrain,
+  isParseFailure,
+  buildFormatError,
+  type WriteResult,
+} from "./writer.js";
+import {
+  searchGbrainForLinks,
+  writeToGbrainWithRetry,
+  type GbrainTranslateFn,
+} from "./targets/gbrain.js";
+import { writePensieve } from "./pensieve-writer.js";
 import { loadConfig } from "./config.js";
 import { completeSimple } from "@mariozechner/pi-ai";
-import type { QueueItem, TargetStatus, GbrainWriteOutput, GbrainWriteInput } from "./types.js";
+import type { TargetStatus, GbrainWriteInput } from "./types.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-// ── Extract text from assistant message ────────────────────────
+// ── Helpers ────────────────────────────────────────────────────
 
 function logLine(projectRoot: string, line: string): void {
   try {
@@ -54,29 +46,16 @@ function logLine(projectRoot: string, line: string): void {
   } catch { /* silent */ }
 }
 
-function extractText(content: unknown): string {
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return "";
-  const parts: string[] = [];
-  for (const block of content as any[]) {
-    if (block && block.type === "text" && typeof block.text === "string") {
-      parts.push(block.text);
-    }
-  }
-  return parts.join("\n");
+const STATUS_PENSIEVE = "pi-sediment-pensieve";
+const STATUS_GBRAIN = "pi-sediment-gbrain";
+const STATUS_LEGACY = "pi-sediment";
+
+function setStatus(ctx: any, key: string, value: string | undefined): void {
+  if (!ctx.hasUI) return;
+  try { ctx.ui.setStatus(key, value); } catch { /* print/rpc mode */ }
 }
 
-// ── Status bar ─────────────────────────────────────────────────
-
-function formatStatus(targets: TargetStatus): string {
-  const parts: string[] = [];
-  if (targets.pensieve) parts.push("pensieve");
-  if (targets.gbrain) parts.push("gbrain");
-  if (parts.length === 0) return "⏳ sediment: no targets";
-  return `⏳ sediment → ${parts.join("+")}`;
-}
-
-// ── gbrain translation (non-Latin → English retry) ──────────────
+// ── gbrain translation (non-Latin → English) ────────────────────
 
 const TRANSLATE_SYSTEM_PROMPT = `You are a technical translator. Your ONLY job is to translate the given technical content to English.
 
@@ -126,11 +105,12 @@ async function translateGbrainEntry(
         headers: auth.headers,
         signal: ac.signal,
         maxTokens: 8192,
-        ...(config.reasoning !== "off" ? { reasoning: config.reasoning } : {}),
       },
     );
 
-    if (response.stopReason !== "complete") return null;
+    if (response.stopReason === "error" || response.stopReason === "aborted" || response.stopReason === "length") {
+      return null;
+    }
 
     const text = response.content
       .filter((c: any) => c.type === "text")
@@ -143,10 +123,17 @@ async function translateGbrainEntry(
 
     if (!engTitle || !engBody) return null;
 
+    const { sanitizeContent } = await import("./prompts.js");
+    const safeContent = sanitizeContent(engBody);
+    if (!safeContent) {
+      logLine(projectRoot, `gbrain translate: rejected (injection pattern)`);
+      return null;
+    }
+
     return {
       title: engTitle.slice(0, 200),
       tags: entry.tags,
-      content: engBody,
+      content: safeContent,
     };
   } catch {
     return null;
@@ -155,221 +142,154 @@ async function translateGbrainEntry(
   }
 }
 
-// ── Pensieve pipeline (internal evaluator+writer for now) ──────
+// ── gbrain pipeline (with parse:fail retry) ────────────────────
 
-async function runPensievePipeline(
-  item: QueueItem,
-  ctx: any,
-): Promise<{ ok: boolean; label: string } | null> {
-  if (!item.targets.pensieve) return null;
+const MAX_GBRAIN_RETRIES = 2;
 
-  // For now, keep the existing Pensieve evaluator+writer path.
-  // TODO: delegate to /skill:pensieve self-improve when extension-to-skill
-  // invocation becomes available in pi.
-  const { evaluate } = await import("./evaluator-pensieve.js");
-  const { write: writePensieveEntry } = await import("./writer-pensieve.js");
+async function processGbrain(
+  window: RunWindow,
+  targets: TargetStatus,
+  registry: any,
+): Promise<RunResult> {
+  logLine(window.projectRoot, `gbrain window: entries=${window.entryCount} from=${window.fromEntryId ?? "START"} to=${window.toEntryId}`);
 
-  const evalResult = await evaluate(
-    item.lastAssistantMessage,
-    item.projectRoot,
-    ctx.modelRegistry,
-    item.signal,
-  );
-
-  if (evalResult.decision === "skip") return null;
-
-  const writeResult = await writePensieveEntry(
-    evalResult.summary,
-    item.lastAssistantMessage,
-    item.projectRoot,
-    ctx.modelRegistry,
-    item.signal,
-  );
-
-  if (!writeResult) return null;
-
-  const ok = await writeToPensieve(writeResult, item.projectRoot);
-  return { ok, label: writeResult.label };
-}
-
-// ── gbrain pipeline (new: evaluate → search → write with wikilinks) ──
-
-async function runGbrainPipeline(
-  item: QueueItem,
-  ctx: any,
-): Promise<{ ok: boolean; label: string } | null> {
-  if (!item.targets.gbrain) return null;
-
-  // 1. Evaluate: is this a universal engineering principle?
+  // 1. Evaluate the whole checkpoint window.
   const evalResult = await evaluateForGbrain(
-    item.lastAssistantMessage,
-    item.targets,
-    item.projectRoot,
-    ctx.modelRegistry,
-    item.signal,
+    window.text,
+    targets,
+    window.projectRoot,
+    registry,
+    undefined,
   );
 
-  if (evalResult.decision === "skip") return null;
+  if (evalResult.decision === "skip") return "processed";
 
-  // 2. Search gbrain for related pages (for [[wikilink]] cross-references)
-  const relatedPages = await searchGbrainForLinks(evalResult.summary, item.projectRoot);
+  // 2. Search related pages.
+  const relatedPages = await searchGbrainForLinks(evalResult.summary, window.projectRoot);
 
-  // 3. Write: generate gbrain markdown with wikilinks and timeline
-  const dateIso = new Date().toISOString().slice(0, 10);
-  const writeInput: GbrainWriteInput = {
+  // 3. Write with retry on parse failure. Use the source conversation
+  // timestamp, not writer wall-clock time; retries/backoff may run later.
+  const dateIso = window.sourceDateIso ?? new Date().toISOString().slice(0, 10);
+  let writeInput: GbrainWriteInput = {
     summary: evalResult.summary,
     dateIso,
-    lastAssistantMessage: item.lastAssistantMessage,
+    lastAssistantMessage: window.text,
     relatedPages,
   };
 
-  const writeResult = await writeForGbrain(
-    writeInput,
-    item.projectRoot,
-    ctx.modelRegistry,
-    item.signal,
-  );
+  let writeResult: WriteResult | null = null;
+  for (let attempt = 0; attempt <= MAX_GBRAIN_RETRIES; attempt++) {
+    writeResult = await writeForGbrain(writeInput, window.projectRoot, registry);
+    if (!writeResult) {
+      logLine(window.projectRoot, `gbrain pipeline: write failed (API error/abort) attempt=${attempt}`);
+      return "failed";
+    }
+    if (!isParseFailure(writeResult)) break;
 
-  if (!writeResult) return null;
+    const formatError = buildFormatError(writeResult.rawText);
+    writeInput = { ...writeInput, formatError };
+    logLine(window.projectRoot, `gbrain pipeline: parse fail, retry ${attempt + 1}/${MAX_GBRAIN_RETRIES}`);
+  }
 
-  // 4. Build translation callback for non-Latin content retry
-  const translateFn: GbrainTranslateFn = writeResult
-    ? async (entry, attempt) => translateGbrainEntry(entry, item.projectRoot, ctx.modelRegistry)
-    : async () => null;
+  if (!writeResult || isParseFailure(writeResult)) {
+    logLine(window.projectRoot, `gbrain pipeline: parse fail exhausted retries`);
+    return "failed";
+  }
 
-  // 5. Write to gbrain (with retry + translation fallback)
-  const ok = await writeToGbrainWithRetry(writeResult, item.projectRoot, translateFn);
-  return { ok, label: writeResult.title };
+  // 4. Write to gbrain CLI.
+  const translateFn: GbrainTranslateFn = async (entry, attempt) =>
+    translateGbrainEntry(entry, window.projectRoot, registry);
+
+  const ok = await writeToGbrainWithRetry(writeResult.output, window.projectRoot, translateFn);
+  logLine(window.projectRoot, `sediment done: gbrain=${ok ? "✓" : "✗"}`);
+  return ok ? "processed" : "failed";
 }
 
-// ── Worker callback ────────────────────────────────────────────
+// ── Pensieve pipeline (single LLM call: evaluate + write) ─────
 
-async function processItem(item: QueueItem, ctx: any): Promise<void> {
-  // Status: evaluating
-  if (ctx.hasUI) {
-    try { ctx.ui.setStatus("pi-sediment", "⏳ sediment: evaluating..."); } catch {}
+async function processPensieve(
+  window: RunWindow,
+  registry: any,
+): Promise<RunResult> {
+  logLine(window.projectRoot, `pensieve window: entries=${window.entryCount} from=${window.fromEntryId ?? "START"} to=${window.toEntryId}`);
+
+  const status = await writePensieve(window.text, window.projectRoot, registry);
+  if (status === "written") {
+    logLine(window.projectRoot, `sediment done: pensieve=✓`);
+    return "processed";
   }
-
-  // Run Pensieve and gbrain pipelines in parallel
-  const results = await Promise.all([
-    runPensievePipeline(item, ctx),
-    runGbrainPipeline(item, ctx),
-  ]);
-
-  // Log results
-  const writtenParts: string[] = [];
-  for (const r of results) {
-    if (!r) continue;
-    const status = r.ok ? "✓" : "✗";
-    writtenParts.push(`${status}`);
-  }
-  if (writtenParts.length > 0) {
-    logLine(item.projectRoot, `sediment done: pensieve=${writtenParts[0] || "-"} gbrain=${writtenParts[1] || "-"}`);
+  if (status === "skipped") {
+    return "processed";
   }
 
-  // Notify
-  const labels: string[] = [];
-  for (const r of results) {
-    if (r) labels.push(r.label.slice(0, 40));
-  }
-  if (labels.length > 0 && ctx.hasUI) {
-    try {
-      ctx.ui.notify(`sedimented → ${labels.join(" | ")}`, "info");
-    } catch { /* print mode */ }
-  }
-
-  // Revert status bar
-  if (ctx.hasUI) {
-    try { ctx.ui.setStatus("pi-sediment", formatStatus(item.targets)); } catch {}
-  }
+  logLine(window.projectRoot, `sediment done: pensieve=✗`);
+  return "failed";
 }
 
 // ── Extension entry ────────────────────────────────────────────
 
 export default function piSediment(pi: ExtensionAPI) {
-  let targets: TargetStatus = { pensieve: false, gbrain: false, gbrainPageCount: null };
-  const sessionStates = new Map<string, { targets: TargetStatus; cwd: string }>();
-  const sessionAbortControllers = new Map<string, AbortController>();
+  let targets: TargetStatus = {
+    pensieve: false,
+    gbrain: false,
+    gbrainPageCount: null,
+  };
 
-  // ── session_start: detect targets ──────────────────────────
   pi.on("session_start", async (_event: SessionStartEvent, ctx) => {
-    const sid = ctx.sessionManager.getSessionFile?.() ?? "ephemeral";
     targets = await detectTargets(ctx.cwd);
-    sessionStates.set(sid, { targets: { ...targets }, cwd: ctx.cwd });
-    if (ctx.hasUI) {
-      try { ctx.ui.setStatus("pi-sediment", formatStatus(targets)); } catch {}
+
+    setStatus(ctx, STATUS_LEGACY, undefined);
+
+    if (targets.pensieve) {
+      setStatus(ctx, STATUS_PENSIEVE, undefined);
+      registerScheduler("pensieve", async (window: RunWindow) => {
+        setStatus(ctx, STATUS_PENSIEVE, "⏳ Pz");
+        try {
+          return await processPensieve(window, ctx.modelRegistry);
+        } finally {
+          setStatus(ctx, STATUS_PENSIEVE, undefined);
+        }
+      });
+    } else {
+      setStatus(ctx, STATUS_PENSIEVE, undefined);
+    }
+
+    if (targets.gbrain) {
+      setStatus(ctx, STATUS_GBRAIN, undefined);
+      registerScheduler("gbrain", async (window: RunWindow) => {
+        setStatus(ctx, STATUS_GBRAIN, "⏳ Gb");
+        try {
+          return await processGbrain(window, targets, ctx.modelRegistry);
+        } finally {
+          setStatus(ctx, STATUS_GBRAIN, undefined);
+        }
+      });
+    } else {
+      setStatus(ctx, STATUS_GBRAIN, undefined);
     }
   });
 
-  // ── before_agent_start: re-detect (gbrain may come online) ─
-  pi.on("before_agent_start", async (_event, ctx) => {
-    const sid = ctx.sessionManager.getSessionFile?.() ?? "ephemeral";
-    const fresh = await detectTargets(ctx.cwd);
-    const prev = sessionStates.get(sid);
-    if (!prev || prev.targets.gbrain !== fresh.gbrain || prev.targets.pensieve !== fresh.pensieve) {
-      targets = fresh;
-      sessionStates.set(sid, { targets: { ...fresh }, cwd: ctx.cwd });
-    }
-    if (ctx.hasUI) {
-      try { ctx.ui.setStatus("pi-sediment", formatStatus(targets)); } catch {}
-    }
-  });
-
-  // ── session_shutdown: cleanup ────────────────────────────
-  pi.on("session_shutdown", (_event: SessionShutdownEvent, ctx) => {
-    const sid = ctx.sessionManager.getSessionFile?.() ?? "ephemeral";
-    const ctrl = sessionAbortControllers.get(sid);
-    if (ctrl) {
-      ctrl.abort();
-      sessionAbortControllers.delete(sid);
-    }
-    clearSession(sid);
-    sessionStates.delete(sid);
-  });
-
-  // ── agent_end: push to queue ───────────────────────────────
   pi.on("agent_end", async (_event: AgentEndEvent, ctx) => {
     if (!targets.pensieve && !targets.gbrain) return;
 
-    const sid = ctx.sessionManager.getSessionFile?.() ?? "ephemeral";
-    const cwd = ctx.cwd;
-
-    let ctrl = sessionAbortControllers.get(sid);
-    if (!ctrl || ctrl.signal.aborted) {
-      ctrl = new AbortController();
-      sessionAbortControllers.set(sid, ctrl);
-    }
-
-    // Extract last assistant message
     const branch = ctx.sessionManager.getBranch();
-    const lastAssistant = [...branch]
-      .reverse()
-      .find((e) => e.type === "message" && e.message?.role === "assistant");
-    if (!lastAssistant || lastAssistant.type !== "message") return;
-    const lastMsg = extractText(lastAssistant.message.content);
-    if (!lastMsg) return;
+    const head = branch[branch.length - 1];
+    if (!head?.id) return;
 
-    const item: QueueItem = {
-      sessionId: sid,
-      lastAssistantMessage: lastMsg,
-      projectRoot: cwd,
-      targets: { ...targets },
-      cwd,
-      signal: ctrl.signal,
+    const snapshot = {
+      sessionId: ctx.sessionManager.getSessionFile?.() ?? ctx.sessionManager.getSessionId?.() ?? "ephemeral",
+      projectRoot: ctx.cwd,
+      headEntryId: head.id,
+      entries: branch,
     };
 
-    enqueue(sid, item);
-
-    startWorker(sid, async (qItem: QueueItem) => {
-      const state = sessionStates.get(qItem.sessionId);
-      if (!state) return;
-      const ctxStub = {
-        modelRegistry: ctx.modelRegistry,
-        signal: qItem.signal,
-        hasUI: ctx.hasUI,
-        ui: ctx.ui,
-      };
-      await processItem(qItem, ctxStub);
-    });
+    if (targets.pensieve) {
+      setStatus(ctx, STATUS_PENSIEVE, "⏱ Pz");
+      markPending("pensieve", snapshot);
+    }
+    if (targets.gbrain) {
+      setStatus(ctx, STATUS_GBRAIN, "⏱ Gb");
+      markPending("gbrain", snapshot);
+    }
   });
 }

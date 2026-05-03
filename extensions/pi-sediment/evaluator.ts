@@ -59,7 +59,7 @@ export async function evaluateForGbrain(
   targets: TargetStatus,
   projectRoot: string,
   registry: ModelRegistry,
-  signal: AbortSignal | undefined,
+  _signal?: AbortSignal | undefined,
 ): Promise<GbrainEvalResult> {
   const config = loadConfig(projectRoot);
   const tag = `gbrain-evaluator`;
@@ -74,8 +74,6 @@ export async function evaluateForGbrain(
 
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(new Error("timeout")), config.evalTimeoutMs);
-  const onParent = () => ac.abort(new Error("parent aborted"));
-  signal?.addEventListener("abort", onParent, { once: true });
 
   try {
     const response = await completeSimple(
@@ -93,7 +91,6 @@ export async function evaluateForGbrain(
         headers: resolved.headers,
         signal: ac.signal,
         maxTokens: 512,
-        ...(config.reasoning !== "off" ? { reasoning: config.reasoning } : {}),
       },
     );
 
@@ -124,6 +121,5 @@ export async function evaluateForGbrain(
     return { decision: "skip", summary: "" };
   } finally {
     clearTimeout(timer);
-    signal?.removeEventListener("abort", onParent);
   }
 }

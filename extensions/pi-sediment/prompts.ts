@@ -2,7 +2,7 @@
  * pi-sediment prompts — per-target evaluator + writer.
  *
  * Pensieve: delegated to /skill:pensieve self-improve (no custom prompt needed).
- * gbrain:   dedicated evaluator + writer with wikilinks and timeline support.
+ * gbrain:   dedicated evaluator + writer with timeline support.
  */
 
 import type { GbrainSearchResult } from "./types.js";
@@ -97,56 +97,70 @@ Given an engineering insight, produce a gbrain page: a universal principle
 distilled from the source material. The output must be self-contained and
 readable without referencing the original conversation.
 
-Output format:
+CRITICAL — OUTPUT FORMAT (parseable, no deviation):
 
 ## GBRAIN
-title: <= 100 char headline (present-tense imperative, e.g. "Verify Connectivity By Performing A Real Operation")
-tags: engineering, relevant-topic-1, relevant-topic-2
+title: Present-Tense Imperative Headline (<= 100 chars)
+tags: engineering, topic
 __CONTENT__
-Full markdown body with these sections:
-
-# Title
+# Title (same as headline above)
 
 ## Principle
-One sentence stating the principle.
+One sentence.
 
 ## Guidance
-- 3-5 actionable guidelines
+- bullet 1
+- bullet 2
 
 ## When this applies
-- Scenarios where this principle helps
+- scenario
 
 ## Boundaries
-- When NOT to apply this (important — prevents overgeneralization)
+- when NOT to apply
 
 ## Timeline
-- **{date}** | pi-sediment — One-line summary of when this insight was captured
+- **{date}** | pi-sediment — One-line summary
 
-RULES:
-- ALL output (title, tags, body, every section) MUST be in English — this is a universal knowledge base
+FORMAT RULES (NON-NEGOTIABLE):
+1. The FIRST LINE of output MUST be exactly "## GBRAIN" (no code fences, no preamble)
+2. The second line MUST be "title: ..."
+3. The third line MUST be "tags: ..."
+4. The fourth line MUST be "__CONTENT__"
+5. After __CONTENT__, a blank line, then the markdown body
+6. Do NOT wrap the output in \`\`\` code fences
+7. ALL text MUST be in English
+
+CONTENT RULES:
 - Title must be in present-tense imperative form
-- Content must contain NO file paths, NO module names, NO project specifics
-- When referencing related engineering principles that exist as brain pages,
-  use [[exact-slug]] wikilink syntax (see the list of related pages provided
-  in the prompt for available slugs)
-- The Timeline section MUST be included with the date provided
+- No file paths, module names, or project specifics anywhere
+- Related pages are added to frontmatter automatically; mention related concepts by title when useful
+- The Timeline section MUST include the provided date
+- The Timeline section MUST be the FINAL section; put no prose after the timeline bullet
+- Put all explanatory synthesis before ## Timeline, never after it
 - Tags must include at least one specific topic tag beyond "engineering"
-- Body must be >= 200 words of original synthesis, not a copy-paste`;
+- Body must be >= 200 words of original synthesis`;
 
 export function buildGbrainWritePrompt(args: {
   summary: string;
   dateIso: string;
   lastAssistantMessage: string;
   relatedPages: GbrainSearchResult[];
+  formatError?: string;
 }): string {
   let relatedSection = "";
   if (args.relatedPages.length > 0) {
     const lines = args.relatedPages.map(
-      (p) => `- [[${p.slug}]]: ${p.title}`
+      (p) => `- ${p.title} (${p.slug})`
     );
     relatedSection =
-      "\n\nExisting related pages in gbrain (use these slugs when adding [[wikilink]] references):\n" +
+      "\n\nExisting related pages in gbrain (for conceptual context; links are added via frontmatter automatically):\n" +
       lines.join("\n");
+  }
+
+  let formatErrorSection = "";
+  if (args.formatError) {
+    formatErrorSection =
+      `\n\n⚠️  PREVIOUS ATTEMPT FAILED — FORMAT ERROR:\n${args.formatError}\n\nCRITICAL: Fix the format error above. Follow the output format EXACTLY as specified.`;
   }
 
   return `Insight summary: ${args.summary}
@@ -157,7 +171,7 @@ Source material (full assistant message):
 
 <source>
 ${args.lastAssistantMessage}
-</source>${relatedSection}
+</source>${relatedSection}${formatErrorSection}
 
 Produce the gbrain entry using the markdown section format above.`;
 }

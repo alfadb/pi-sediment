@@ -40,10 +40,17 @@ function logLine(projectRoot: string, line: string): void {
 /** Wrap body content with minimal YAML frontmatter (gbrain --content requires it). */
 function wrapFrontmatter(entry: GbrainWriteOutput): string {
   const tags = entry.tags.map((t) => JSON.stringify(t)).join(", ");
-  return [
+  const lines = [
     "---",
     `title: ${JSON.stringify(entry.title)}`,
     `tags: [${tags}]`,
+  ];
+  if (entry.related && entry.related.length > 0) {
+    const related = entry.related.map((r) => JSON.stringify(r)).join(", ");
+    lines.push(`related: [${related}]`);
+  }
+  return [
+    ...lines,
     "---",
     "",
     entry.content,
@@ -170,32 +177,35 @@ export async function writeToGbrain(
     });
 
     let stderr = "";
+    let resolved = false;
+    const done = (ok: boolean, logMsg: string) => {
+      if (resolved) return;
+      resolved = true;
+      logLine(projectRoot, logMsg);
+      resolve(ok);
+    };
+
     const timer = setTimeout(() => {
       child.kill();
-      logLine(projectRoot, `gbrain write:timeout slug=${slug}`);
-      resolve(false);
-    }, 15_000);
+      done(false, `gbrain write:timeout slug=${slug}`);
+    }, 60_000);
 
     child.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
     child.stdout.on("data", () => {});
 
     child.on("error", (e) => {
       clearTimeout(timer);
-      logLine(projectRoot, `gbrain write:error slug=${slug} ${e.message}`);
-      resolve(false);
+      done(false, `gbrain write:error slug=${slug} ${e.message}`);
     });
 
     child.on("close", (code) => {
       clearTimeout(timer);
       if (code === 0) {
-        logLine(projectRoot, `gbrain write:ok slug=${slug}`);
-        resolve(true);
+        done(true, `gbrain write:ok slug=${slug}`);
       } else if (throttleErr(stderr)) {
-        logLine(projectRoot, `gbrain write:throttle slug=${slug} → deferred`);
-        resolve(true);
+        done(true, `gbrain write:throttle slug=${slug} → deferred`);
       } else {
-        logLine(projectRoot, `gbrain write:fail slug=${slug} code=${code} ${stderr.slice(0, 200)}`);
-        resolve(false);
+        done(false, `gbrain write:fail slug=${slug} code=${code} ${stderr.slice(0, 200)}`);
       }
     });
   });
@@ -225,7 +235,7 @@ function extractKeywords(summary: string): string {
 
 /**
  * Search gbrain for pages related to the insight summary.
- * Used to provide the writer LLM with existing pages for [[wikilink]] cross-references.
+ * Used to provide the writer LLM with existing pages and frontmatter related links.
  */
 export async function searchGbrainForLinks(
   summary: string,
@@ -246,16 +256,23 @@ export async function searchGbrainForLinks(
     );
     if (!stdout) return [];
 
-    // Parse gbrain search output: "[score] slug -- title..."
+    // Parse gbrain search output: "[score] slug -- title...". Search snippets
+    // often begin with a markdown H1 ("# Title"); store a clean title so the
+    // writer doesn't put "# ..." into related frontmatter.
     const results: GbrainSearchResult[] = [];
     const lines = stdout.trim().split("\n");
     for (const line of lines) {
       // Format: [0.1234] slug-name -- Title: description text
       const match = line.match(/^\[?[\d.]+\]?\s+(\S+)\s+--\s+(.+)$/);
       if (match) {
+        const rawTitle = match[2]
+          .split("\n")[0]
+          .replace(/^#+\s*/, "")
+          .trim();
+        const title = rawTitle || match[1];
         results.push({
           slug: match[1],
-          title: match[2].slice(0, 100),
+          title: title.slice(0, 120),
           snippet: match[2].slice(0, 200),
         });
       }

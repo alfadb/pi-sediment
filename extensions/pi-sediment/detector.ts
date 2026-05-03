@@ -41,7 +41,7 @@ async function detectGbrain(): Promise<{ available: boolean; pageCount: number |
     });
     if (!stdout) return { available: false, pageCount: null };
     const doc = JSON.parse(stdout.trim()) as GbrainDoctor;
-    const pageCount = typeof doc.page_count === "number" ? doc.page_count : null;
+    const pageCount = doc.page_count != null ? Number(doc.page_count) : null;
     return { available: true, pageCount };
   } catch {
     return { available: false, pageCount: null };
