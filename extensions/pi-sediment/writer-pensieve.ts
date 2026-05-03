@@ -30,9 +30,11 @@ label: <= 60 char headline
 __CONTENT__
 ---
 type: {kind}
+title: {one-line title matching the # Title heading below}
 id: {slug}
 status: active
 created: {date}
+updated: {date}
 tags: [tag1, tag2]
 ---
 
@@ -42,6 +44,7 @@ Body content with file paths, module names, project-specific details.
 
 RULES:
 - kind: "maxim" for hard rules, "decision" for architectural tradeoffs, "knowledge" for facts/explorations
+- The frontmatter MUST include both 'title' (matching the # heading) and 'updated' (same as created) fields
 - Content MUST include file paths and module names where relevant
 - slug must be lowercase hyphenated
 - Body must be >= 100 words`;
