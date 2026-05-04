@@ -40,10 +40,21 @@ const MAX_LIST_ENTRIES = 300;
  * null if the input tries to break out (../, absolute paths, symlink games).
  */
 function resolvePensievePath(projectRoot: string, relPath: string): string | null {
-  if (typeof relPath !== "string" || !relPath) return null;
+  if (typeof relPath !== "string") return null;
   const root = path.resolve(projectRoot, ".pensieve");
+  const trimmed = relPath.trim();
+  // Empty / "." / "./" / ".pensieve" all mean "the .pensieve root itself".
+  // Returning null on empty was the original behavior, but the agent often
+  // omits the path arg when it wants to scope to all of .pensieve/, and a
+  // null here surfaces as a confusing 'path escapes' error.
+  if (!trimmed || trimmed === "." || trimmed === "./" || trimmed === ".pensieve" || trimmed === "./pensieve") {
+    return root;
+  }
+  // Reject absolute paths up front (security) so they don't get resolved
+  // anywhere relative to root and accidentally pass the prefix check.
+  if (path.isAbsolute(trimmed)) return null;
   // Strip leading ".pensieve/" since the tool surface is rooted there.
-  const cleaned = relPath.replace(/^\.?pensieve[/\\]/, "");
+  const cleaned = trimmed.replace(/^\.?pensieve[/\\]/, "");
   const abs = path.resolve(root, cleaned);
   if (!abs.startsWith(root + path.sep) && abs !== root) return null;
   return abs;
@@ -62,9 +73,10 @@ const gbrainGetSchema = Type.Object({
 
 const pensieveGrepSchema = Type.Object({
   pattern: Type.String({ description: "Pattern (regex by default; pass literal=true to disable regex)." }),
-  path: Type.Optional(Type.String({ description: "Subpath under .pensieve/ to scope search; default = whole .pensieve/." })),
+  path: Type.Optional(Type.String({ description: "Subpath under .pensieve/ to scope search; default = whole .pensieve/. Pass empty/omit for whole tree." })),
   literal: Type.Optional(Type.Boolean({ description: "Treat pattern as literal string (default false)." })),
   ignoreCase: Type.Optional(Type.Boolean({ description: "Case-insensitive (default true)." })),
+  limit: Type.Optional(Type.Number({ description: "Max matches to return (default 80, max 200)." })),
 });
 
 const pensieveReadSchema = Type.Object({
@@ -129,7 +141,8 @@ async function runPensieveGrep(
   const literal = args.literal === true;
   const ignoreCase = args.ignoreCase !== false; // default true
   const subpath = typeof args.path === "string" ? args.path : "";
-  const root = resolvePensievePath(projectRoot, subpath || "");
+  const limit = Math.max(1, Math.min(200, Number(args.limit ?? MAX_GREP_HITS)));
+  const root = resolvePensievePath(projectRoot, subpath);
   if (!root) return err("path escapes .pensieve/ (forbidden)");
   if (!fs.existsSync(root)) return err(`path does not exist: ${subpath || ".pensieve/"}`);
 
@@ -147,10 +160,10 @@ async function runPensieveGrep(
     });
     const lines = (stdout ?? "").split("\n").filter(Boolean);
     if (lines.length === 0) return ok("(no matches)");
-    const truncated = lines.slice(0, MAX_GREP_HITS);
+    const truncated = lines.slice(0, limit);
     // Make paths relative for readability.
     const rel = truncated.map((l) => l.replace(projectRoot + path.sep, ""));
-    const more = lines.length > MAX_GREP_HITS ? `\n[+${lines.length - MAX_GREP_HITS} more matches truncated]` : "";
+    const more = lines.length > limit ? `\n[+${lines.length - limit} more matches truncated]` : "";
     return ok(rel.join("\n") + more);
   } catch (e: any) {
     // grep exits 1 when no matches — that's not an error from the agent's POV.

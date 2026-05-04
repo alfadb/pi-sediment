@@ -1,11 +1,16 @@
 /**
- * pi-sediment Pensieve writer — single LLM call (evaluate + write combined).
+ * pi-sediment Pensieve writer — agent loop with read-only knowledge probes.
  *
- * One prompt handles both decisions: return SKIP or produce a full Pensieve entry.
- * Writes to .pensieve/short-term/ then refreshes project state.
+ * The model is given the assistant turn plus a tool set that can grep/read
+ * .pensieve/ and search/get gbrain. It explores existing memory however it
+ * sees fit, then emits one of:
+ *
+ *   SKIP                       — no durable insight
+ *   SKIP_DUPLICATE: <relPath>   — already covered
+ *   ## PENSIEVE mode:update update_path:<relPath> + body  — overwrite
+ *   ## PENSIEVE mode:new ...    — create new entry
  */
 
-import { completeSimple } from "@mariozechner/pi-ai";
 import type { ModelRegistry } from "@mariozechner/pi-coding-agent";
 import { spawn } from "node:child_process";
 import * as fs from "node:fs";
@@ -14,6 +19,8 @@ import * as os from "node:os";
 import { formatModelRef, loadConfig } from "./config.js";
 import { sanitizeContent } from "./prompts.js";
 import { sanitizeSlug } from "./utils.js";
+import { runAgentLoop } from "./agent-loop.js";
+import { buildLookupTools } from "./lookup-tools.js";
 import type { ResolvedModel } from "./types.js";
 
 // ── Prompt ─────────────────────────────────────────────────────
@@ -171,50 +178,55 @@ export async function writePensieve(
   const timer = setTimeout(() => ac.abort(new Error("timeout")), config.writeTimeoutMs);
 
   try {
-    const response = await completeSimple(
-      resolved.model,
-      {
-        systemPrompt: PENSIEVE_PROMPT,
-        messages: [{
-          role: "user",
-          content: [{
-            type: "text",
-            text: `Date: ${dateIso}\n\nAssistant message:\n\n<message>\n${message}\n</message>`,
-          }],
-          timestamp: Date.now(),
-        }],
+    const { tools, handlers } = buildLookupTools(projectRoot);
+    const userPrompt =
+      `Date: ${dateIso}\n\n` +
+      `Use the read-only tools to check what's already in .pensieve/ (and gbrain ` +
+      `for cross-reference) before deciding. Then emit your terminal output.\n\n` +
+      `Assistant turn:\n\n<message>\n${message}\n</message>`;
+
+    const result = await runAgentLoop({
+      model: resolved.model,
+      apiKey: resolved.apiKey,
+      headers: resolved.headers,
+      systemPrompt: PENSIEVE_PROMPT,
+      userPrompt,
+      tools,
+      handlers,
+      signal: ac.signal,
+      maxTokens: 16384,
+      reasoning: config.reasoning,
+      onEvent: (ev) => {
+        if (ev.kind === "tool_call") {
+          logLine(projectRoot, `${tag} tool:${ev.name} args=${ev.argSummary.slice(0, 120)}`);
+        } else if (ev.kind === "tool_result") {
+          logLine(projectRoot, `${tag} tool:${ev.name} → ${ev.ok ? "ok" : "err"} bytes=${ev.bytes}`);
+        } else if (ev.kind === "llm_done" && ev.stopReason !== "stop") {
+          logLine(projectRoot, `${tag} llm turn=${ev.turn} stop=${ev.stopReason} toolCalls=${ev.toolCalls}`);
+        }
       },
-      {
-        apiKey: resolved.apiKey,
-        headers: resolved.headers,
-        signal: ac.signal,
-        maxTokens: 16384,
-        ...(config.reasoning !== "off" ? { reasoning: config.reasoning } : {}),
-      },
-    );
+    });
 
-    if (response.stopReason === "error") {
-      logLine(projectRoot, `${tag} call:error ${response.errorMessage || "unknown"}`);
-      return "failed";
-    }
-    if (response.stopReason === "aborted") {
-      logLine(projectRoot, `${tag} call:aborted`);
-      return "failed";
-    }
-    if (response.stopReason === "length") {
-      logLine(projectRoot, `${tag} call:length`);
+    if (!result.ok) {
+      logLine(projectRoot, `${tag} agent:${result.stopReason} ${result.errorMessage ?? ""} turns=${result.turns} toolCalls=${result.toolCalls}`);
       return "failed";
     }
 
-    const text = response.content
-      .filter((c): c is { type: "text"; text: string } => c.type === "text")
-      .map((c) => c.text)
-      .join("\n")
-      .trim();
+    logLine(projectRoot, `${tag} agent:done turns=${result.turns} toolCalls=${result.toolCalls}`);
+    const text = result.finalText.trim();
 
-    // Check for SKIP
-    if (/^SKIP\s*$/im.test(text)) {
+    // Terminal A: SKIP exactly
+    if (/^SKIP\s*$/.test(text)) {
       logLine(projectRoot, `${tag} decision:skip`);
+      return "skipped";
+    }
+
+    // Terminal B: SKIP_DUPLICATE: <relPath> [— reason]
+    const dupMatch = text.match(/^SKIP_DUPLICATE:\s*(\S+)\s*(?:[—\-]\s*(.*))?$/m);
+    if (dupMatch) {
+      const relPath = dupMatch[1];
+      const reason = (dupMatch[2] ?? "").trim();
+      logLine(projectRoot, `${tag} decision:skip_duplicate path=${relPath} reason="${reason.slice(0, 120)}"`);
       return "skipped";
     }
 
@@ -227,7 +239,10 @@ export async function writePensieve(
     const headerRegex = /^#{2,3}\s+PENSIEVE\s*$/mi;
     const headerMatch = clean.match(headerRegex);
     if (!headerMatch || headerMatch.index === undefined) {
-      logLine(projectRoot, `${tag} parse:fail no ## PENSIEVE header`);
+      // Log a snippet of what the model actually emitted so we can debug
+      // why it produced neither SKIP nor a ## PENSIEVE block.
+      const snippet = clean.slice(0, 200).replace(/\s+/g, " ");
+      logLine(projectRoot, `${tag} parse:fail no ## PENSIEVE header head="${snippet}"`);
       return "failed";
     }
 
