@@ -16,7 +16,14 @@ import type {
 } from "@mariozechner/pi-coding-agent";
 
 import { detectTargets } from "./detector.js";
-import { registerScheduler, markPending, type RunResult, type RunWindow } from "./scheduler.js";
+import {
+  registerScheduler,
+  markPending,
+  onPhaseChange,
+  type RunResult,
+  type RunWindow,
+  type SchedulerPhase,
+} from "./scheduler.js";
 import { evaluateForGbrain } from "./evaluator.js";
 import {
   writeForGbrain,
@@ -48,19 +55,38 @@ function logLine(projectRoot: string, line: string): void {
 
 const STATUS_PENSIEVE = "pi-sediment-pensieve";
 const STATUS_GBRAIN = "pi-sediment-gbrain";
+// Legacy single-key status from before per-target split. Kept only so we
+// can clear any stale value left in a host UI from older versions.
 const STATUS_LEGACY = "pi-sediment";
 
 function setStatus(ctx: any, key: string, value: string | undefined): void {
-  // Defensive: ctx may be stale (session replaced/reloaded since session_start
-  // captured this closure). Even reading ctx.hasUI on a stale ctx throws —
-  // so the guard must live INSIDE the try, not outside it. If this throws in
-  // a worker's finally{} block, the whole promise rejects and the scheduler
-  // re-runs the same window (causing duplicate writes + ever-growing
-  // retryCount in .pi-sediment/state.json).
+  // Defensive: ctx may be stale (session replaced/reloaded since the closure
+  // captured it). Even reading ctx.hasUI on a stale ctx throws — so the
+  // guard must live INSIDE the try. If this leaks out of a worker promise,
+  // the scheduler interprets it as failure and the retry-loop bug returns.
   try {
     if (!ctx?.hasUI) return;
     ctx.ui.setStatus(key, value);
   } catch { /* stale ctx / print / rpc mode */ }
+}
+
+/**
+ * Map a scheduler phase to its UI glyph. Worker code never writes status
+ * directly — the scheduler is the single source of truth for what's
+ * happening per target, and the UI is just a projection.
+ *
+ *   idle    → cleared (undefined)
+ *   pending → ⏱ (queued, includes retry-backoff windows)
+ *   running → ⏳ (worker actively executing)
+ */
+function phaseGlyph(target: string, phase: SchedulerPhase): string | undefined {
+  if (phase === "idle") return undefined;
+  const tag = target === "pensieve" ? "Pz" : "Gb";
+  return phase === "running" ? `⏳ ${tag}` : `⏱ ${tag}`;
+}
+
+function statusKeyFor(target: string): string {
+  return target === "pensieve" ? STATUS_PENSIEVE : STATUS_GBRAIN;
 }
 
 // ── gbrain translation (non-Latin → English) ────────────────────
@@ -242,59 +268,65 @@ export default function piSediment(pi: ExtensionAPI) {
     gbrain: false,
     gbrainPageCount: null,
   };
-  // Live ctx, refreshed on session_start and agent_end. Workers reference
-  // this via closure; setStatus is defensive against staleness anyway.
+  // Live ctx, refreshed on every session_start and agent_end. The phase
+  // listener (registered once per process) reads this to write the bottom
+  // bar against whatever session is currently alive. Never captured by
+  // worker closures.
   let lastCtx: any = null;
+  let phaseListenerAttached = false;
 
   pi.on("session_start", async (_event: SessionStartEvent, ctx) => {
     targets = await detectTargets(ctx.cwd);
+    lastCtx = ctx;
 
+    // Clear the legacy unsplit key once — harmless on hosts that never had it.
     setStatus(ctx, STATUS_LEGACY, undefined);
+
+    // Subscribe ONCE per process. The scheduler's `states` Map and listener
+    // set are module-scope, so subscribing again on every session_start
+    // would leak listeners and double-write status.
+    if (!phaseListenerAttached) {
+      phaseListenerAttached = true;
+      onPhaseChange((target, phase) => {
+        setStatus(lastCtx, statusKeyFor(target), phaseGlyph(target, phase));
+      });
+    }
 
     // CRITICAL: worker closures must NOT capture `ctx`. The ctx supplied to
     // session_start becomes stale once the host swaps sessions (newSession,
     // fork, switchSession, reload), and any property access on a stale ctx
     // throws. Workers run inside the scheduler's promise chain, so a throw
-    // there is interpreted as worker failure — retryCount climbs forever
-    // even though the actual write may have succeeded on a previous tick.
+    // there is interpreted as failure — retryCount climbs forever even
+    // though the actual write may have succeeded.
     //
-    // Instead, we read modelRegistry off `window`, which is rebuilt from the
-    // most recent agent_end ctx (see markPending below). Status writes use
-    // module-level `lastCtx`, refreshed on every agent_end.
-    lastCtx = ctx;
-
+    // The fix has two halves:
+    //  (1) Workers read modelRegistry off `window` (snapshotted from the
+    //      live agent_end ctx), not off any captured `ctx`.
+    //  (2) Workers do not write the UI at all. Status is driven by the
+    //      scheduler's phase listener using `lastCtx` — which is updated
+    //      on every event, so it can never go stale within the same
+    //      synchronous chain that emits the phase change.
     if (targets.pensieve) {
-      setStatus(lastCtx, STATUS_PENSIEVE, undefined);
       registerScheduler("pensieve", async (window: RunWindow) => {
-        setStatus(lastCtx, STATUS_PENSIEVE, "⏳ Pz");
-        try {
-          return await processPensieve(window, window.modelRegistry);
-        } finally {
-          setStatus(lastCtx, STATUS_PENSIEVE, undefined);
-        }
+        return await processPensieve(window, window.modelRegistry);
       });
     } else {
-      setStatus(lastCtx, STATUS_PENSIEVE, undefined);
+      // Target disabled — ensure any leftover status from a prior session is gone.
+      setStatus(ctx, STATUS_PENSIEVE, undefined);
     }
 
     if (targets.gbrain) {
-      setStatus(lastCtx, STATUS_GBRAIN, undefined);
       registerScheduler("gbrain", async (window: RunWindow) => {
-        setStatus(lastCtx, STATUS_GBRAIN, "⏳ Gb");
-        try {
-          return await processGbrain(window, targets, window.modelRegistry);
-        } finally {
-          setStatus(lastCtx, STATUS_GBRAIN, undefined);
-        }
+        return await processGbrain(window, targets, window.modelRegistry);
       });
     } else {
-      setStatus(lastCtx, STATUS_GBRAIN, undefined);
+      setStatus(ctx, STATUS_GBRAIN, undefined);
     }
   });
 
   pi.on("agent_end", async (_event: AgentEndEvent, ctx) => {
-    // Refresh module-level live ctx so worker setStatus calls don't touch a
-    // stale session_start ctx.
+    // Refresh live ctx for the phase listener; if the listener fires after
+    // this event, it will write to the fresh ctx.
     lastCtx = ctx;
 
     if (!targets.pensieve && !targets.gbrain) return;
@@ -308,18 +340,16 @@ export default function piSediment(pi: ExtensionAPI) {
       projectRoot: ctx.cwd,
       headEntryId: head.id,
       entries: branch,
-      // Snapshot the live registry; workers will use this instead of any
-      // ctx captured at session_start (which would be stale after reloads).
+      // Snapshot the live registry; workers use this instead of any captured ctx.
       modelRegistry: ctx.modelRegistry,
     };
 
-    if (targets.pensieve) {
-      setStatus(ctx, STATUS_PENSIEVE, "⏱ Pz");
-      markPending("pensieve", snapshot);
-    }
-    if (targets.gbrain) {
-      setStatus(ctx, STATUS_GBRAIN, "⏱ Gb");
-      markPending("gbrain", snapshot);
-    }
+    // markPending will emit the phase transition ("pending" or "running"
+    // depending on whether tick can run synchronously). Do NOT setStatus
+    // here — it would either be overwritten in the same microtask
+    // (when tick runs sync → "running") or wrongly stomp a still-running
+    // worker's ⏳ with a misleading ⏱ (when tick early-exits).
+    if (targets.pensieve) markPending("pensieve", snapshot);
+    if (targets.gbrain) markPending("gbrain", snapshot);
   });
 }

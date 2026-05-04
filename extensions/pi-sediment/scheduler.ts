@@ -46,6 +46,38 @@ export interface RunWindow {
 
 type WorkerFn = (window: RunWindow) => Promise<RunResult>;
 
+/**
+ * Lifecycle phase observed by external listeners (typically the UI).
+ * Scheduler is the single source of truth for what's happening per target;
+ * callers should NOT compute or override phase from event handlers — they
+ * just subscribe and react.
+ *
+ *   idle    → nothing pending, nothing running
+ *   pending → work queued (either fresh markPending or retry-scheduled),
+ *             not yet running
+ *   running → worker is actively executing
+ *
+ * Transitions ("→ same" listed for completeness; same-state emits are
+ * deduped by emitPhase and never reach listeners):
+ *
+ *   idle      → pending  : markPending() while worker not running
+ *   idle      → running  : markPending() if buildRunWindow yields work synchronously (typical)
+ *   pending   → running  : tick() picks up the queued window
+ *   pending   → idle     : a same-tick buildRunWindow returns null AND nothing pending (rare)
+ *   running   → idle     : worker finishes, no more pending
+ *   running   → running  : (deduped) coalesced new pending consumed in same tick
+ *   running   → pending  : worker finished but failed; scheduleRetry queued backoff timer
+ *
+ * The UI may see the cluster idle→pending→running collapse to a single
+ * ⏳ frame because emit happens synchronously inside markPending; that's
+ * intentional. Pending becomes visible when buildRunWindow can't build
+ * (e.g., snapshot doesn't yet contain the head id), or while a
+ * retry-backoff timer is waiting.
+ */
+export type SchedulerPhase = "idle" | "pending" | "running";
+
+type PhaseListener = (target: string, phase: SchedulerPhase) => void;
+
 type TargetDiskState = {
   lastProcessedEntryId: string | null;
   pendingHeadEntryId: string | null;
@@ -66,9 +98,19 @@ type TargetState = TargetDiskState & {
   worker: WorkerFn | null;
   latestSnapshot: BranchSnapshot | null;
   retryTimer: ReturnType<typeof setTimeout> | null;
+  phase: SchedulerPhase;
 };
 
 const states = new Map<string, TargetState>(); // target → state
+const phaseListeners = new Set<PhaseListener>();
+
+function emitPhase(target: string, state: TargetState, next: SchedulerPhase): void {
+  if (state.phase === next) return;
+  state.phase = next;
+  for (const fn of phaseListeners) {
+    try { fn(target, next); } catch { /* listener must not break scheduler */ }
+  }
+}
 
 // ── Disk state ────────────────────────────────────────────────
 
@@ -218,6 +260,7 @@ function getOrCreate(target: string): TargetState {
       worker: null,
       latestSnapshot: null,
       retryTimer: null,
+      phase: "idle",
     };
     states.set(target, s);
   }
@@ -242,6 +285,9 @@ function scheduleRetry(target: string, state: TargetState): void {
   if (state.retryTimer) return;
   const retryCount = state.retryCount ?? 1;
   const delayMs = Math.min(60_000, 5_000 * Math.pow(2, Math.max(0, retryCount - 1)));
+  // Phase stays "pending" while waiting for backoff timer — work is queued,
+  // not idle. Otherwise the UI would falsely show idle during retry windows.
+  emitPhase(target, state, "pending");
   state.retryTimer = setTimeout(() => {
     state.retryTimer = null;
     tick(target);
@@ -253,10 +299,18 @@ function tick(target: string): void {
   if (!state || state.running || !state.worker) return;
 
   const run = buildRunWindow(target, state);
-  if (!run) return;
+  if (!run) {
+    // No work buildable — if we just finished a run and pending == processed,
+    // we're truly idle. Otherwise leave phase as caller set it.
+    if (state.pendingHeadEntryId === state.lastProcessedEntryId && !state.retryTimer) {
+      emitPhase(target, state, "idle");
+    }
+    return;
+  }
 
   state.running = true;
   state.lastRunAt = new Date().toISOString();
+  emitPhase(target, state, "running");
   persist(state, target);
 
   void state.worker(run)
@@ -284,8 +338,14 @@ function tick(target: string): void {
       // If new content arrived while running, process the coalesced pending head.
       // On failure, keep the checkpoint unchanged but retry with backoff — no busy loop.
       if (state.pendingHeadEntryId !== state.lastProcessedEntryId) {
-        if ((state.retryCount ?? 0) > 0) scheduleRetry(target, state);
-        else tick(target);
+        if ((state.retryCount ?? 0) > 0) {
+          scheduleRetry(target, state); // emits "pending"
+        } else {
+          tick(target); // emits "running" if work runs, or "idle" via the no-work branch
+        }
+      } else {
+        // Done and nothing pending — truly idle.
+        emitPhase(target, state, "idle");
       }
     });
 }
@@ -296,6 +356,22 @@ export function registerScheduler(target: string, worker: WorkerFn): void {
   const state = getOrCreate(target);
   state.worker = worker;
   tick(target);
+}
+
+/**
+ * Subscribe to phase changes for any target. Returns an unsubscribe fn.
+ * Listener is fired only on transition (idle↔pending↔running), not on no-op
+ * re-emits. Listener errors are swallowed so the scheduler can't be broken
+ * by a buggy UI write.
+ */
+export function onPhaseChange(listener: PhaseListener): () => void {
+  phaseListeners.add(listener);
+  return () => { phaseListeners.delete(listener); };
+}
+
+/** Read current phase — used to seed the UI on registration. */
+export function getPhase(target: string): SchedulerPhase {
+  return states.get(target)?.phase ?? "idle";
 }
 
 export function markPending(target: string, snapshot: BranchSnapshot): void {
@@ -319,6 +395,11 @@ export function markPending(target: string, snapshot: BranchSnapshot): void {
     clearTimeout(state.retryTimer);
     state.retryTimer = null;
   }
+  // Mark phase before tick. If tick can run synchronously, it will overwrite
+  // "pending" with "running" — correct behavior. If tick can't run (worker
+  // already running, or no work buildable yet), "pending" stays visible so
+  // the UI shows ⏱ instead of stale running/idle.
+  if (!state.running) emitPhase(target, state, "pending");
   persist(state, target);
   tick(target);
 }
