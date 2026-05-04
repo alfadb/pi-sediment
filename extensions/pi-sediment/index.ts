@@ -53,6 +53,53 @@ const STATUS_GBRAIN = "pi-sediment-gbrain";
 // can clear any stale value left in a host UI from older versions.
 const STATUS_LEGACY = "pi-sediment";
 
+/**
+ * True when the host pi process is a one-shot subprocess spawned by another
+ * pi (e.g. by pi-multi-agent's print/rpc backends). Such subprocesses inherit
+ * the project cwd, but they should NOT run sediment because:
+ *   1. The conversation is ephemeral / non-interactive; results aren't a
+ *      durable engineering insight worth persisting.
+ *   2. Multiple subprocesses run in parallel against the same .pensieve/ +
+ *      .pi-sediment/state.json — they race on the checkpoint file and
+ *      corrupt each other's state (observed: same window processed by two
+ *      parallel workers, retryCount thrash).
+ *   3. They re-enter the gbrain agent loop, which would itself spawn more
+ *      subprocesses if any tool used multi-dispatch (no recursion guard).
+ *
+ * Detection uses argv: pi-multi-agent's backends always pass `--print` or
+ * `--mode rpc`. Interactive main pi has neither. We also honor an explicit
+ * env opt-out so callers can suppress sediment without depending on argv.
+ */
+function isSubprocessPi(): boolean {
+  if (process.env.PI_SEDIMENT_DISABLE === "1") return true;
+  const argv = process.argv.slice(2);
+  if (argv.includes("--print")) return true;
+  const modeIdx = argv.indexOf("--mode");
+  if (modeIdx >= 0 && argv[modeIdx + 1] === "rpc") return true;
+  return false;
+}
+
+/**
+ * True when the most recent assistant message ended via user abort (ESC).
+ * Sediment skips processing in this case — the user explicitly stopped the
+ * turn, signalling "this output is not what I want". Persisting it would
+ * pollute long-term memory with content the user actively rejected.
+ *
+ * Reads `messages` off AgentEndEvent (not ctx.sessionManager) so we examine
+ * the exact set of messages that just completed, not whatever the session
+ * has accumulated since.
+ */
+function wasAborted(messages: any[] | undefined): boolean {
+  if (!Array.isArray(messages)) return false;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m?.role === "assistant") {
+      return m.stopReason === "aborted";
+    }
+  }
+  return false;
+}
+
 function setStatus(ctx: any, key: string, value: string | undefined): void {
   // Defensive: ctx may be stale (session replaced/reloaded since the closure
   // captured it). Even reading ctx.hasUI on a stale ctx throws — so the
@@ -264,6 +311,13 @@ export default function piSediment(pi: ExtensionAPI) {
   let phaseListenerAttached = false;
 
   pi.on("session_start", async (_event: SessionStartEvent, ctx) => {
+    // Subprocess pi (multi-agent print/rpc) must not run sediment. Detect
+    // once at session_start; cwd-bound subprocess detection won't change.
+    if (isSubprocessPi()) {
+      logLine(ctx.cwd, `sediment disabled: subprocess pi (argv=${process.argv.slice(2).join(" ")})`);
+      targets = { pensieve: false, gbrain: false, gbrainPageCount: null };
+      return;
+    }
     targets = await detectTargets(ctx.cwd);
     lastCtx = ctx;
 
@@ -312,12 +366,21 @@ export default function piSediment(pi: ExtensionAPI) {
     }
   });
 
-  pi.on("agent_end", async (_event: AgentEndEvent, ctx) => {
+  pi.on("agent_end", async (event: AgentEndEvent, ctx) => {
     // Refresh live ctx for the phase listener; if the listener fires after
     // this event, it will write to the fresh ctx.
     lastCtx = ctx;
 
     if (!targets.pensieve && !targets.gbrain) return;
+
+    // ESC-aborted turn: user signalled this output is not what they want.
+    // Skip sediment so we don't persist rejected content to long-term memory.
+    // The conversation head still advances when the next turn completes;
+    // sediment will pick that up on the next agent_end.
+    if (wasAborted((event as any).messages)) {
+      logLine(ctx.cwd, `agent_end: aborted turn — skipping sediment`);
+      return;
+    }
 
     const branch = ctx.sessionManager.getBranch();
     const head = branch[branch.length - 1];
