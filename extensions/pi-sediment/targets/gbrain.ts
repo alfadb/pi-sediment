@@ -12,7 +12,7 @@ import { promisify } from "node:util";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { isNonLatin, sanitizeSlug } from "../utils.js";
+import { gbrainCommand, isNonLatin, sanitizeSlug } from "../utils.js";
 import type { GbrainWriteOutput, GbrainSearchResult } from "../types.js";
 
 const execFileP = promisify(execFile);
@@ -171,7 +171,8 @@ export async function writeToGbrain(
   ];
 
   return new Promise((resolve) => {
-    const child = spawn("gbrain", args, {
+    const [cmd, lead] = gbrainCommand();
+    const child = spawn(cmd, [...lead, ...args], {
       cwd: path.join(os.homedir(), "gbrain"),
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -245,9 +246,10 @@ export async function searchGbrainForLinks(
   if (!query) return [];
 
   try {
+    const [cmd, lead] = gbrainCommand();
     const { stdout } = await execFileP(
-      "gbrain",
-      ["search", query, "--limit", "5"],
+      cmd,
+      [...lead, "search", query, "--limit", "5"],
       {
         timeout: 10_000,
         maxBuffer: 256 * 1024,

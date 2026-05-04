@@ -10,6 +10,7 @@ import { promisify } from "node:util";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { TargetStatus } from "./types.js";
+import { gbrainCommand } from "./utils.js";
 
 const execFileP = promisify(execFile);
 
@@ -34,7 +35,8 @@ interface GbrainDoctor {
 
 async function detectGbrain(): Promise<{ available: boolean; pageCount: number | null }> {
   try {
-    const { stdout } = await execFileP("gbrain", ["doctor", "--json"], {
+    const [cmd, lead] = gbrainCommand();
+    const { stdout } = await execFileP(cmd, [...lead, "doctor", "--json"], {
       timeout: 10_000,
       maxBuffer: 1024 * 1024,
       cwd: `${process.env.HOME}/gbrain`,
