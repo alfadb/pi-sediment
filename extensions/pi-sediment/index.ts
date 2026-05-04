@@ -80,24 +80,48 @@ function isSubprocessPi(): boolean {
 }
 
 /**
- * True when the most recent assistant message ended via user abort (ESC).
- * Sediment skips processing in this case — the user explicitly stopped the
- * turn, signalling "this output is not what I want". Persisting it would
- * pollute long-term memory with content the user actively rejected.
+ * Classify the most recent assistant message's stop reason. Sediment
+ * processes only "clean" turns; everything else is skipped to avoid
+ * persisting half-truths or rejected content to long-term memory.
  *
- * Reads `messages` off AgentEndEvent (not ctx.sessionManager) so we examine
- * the exact set of messages that just completed, not whatever the session
- * has accumulated since.
+ * Stop-reason coverage (pi-ai types StopReason):
+ *   stop     → normal completion, persist
+ *   toolUse  → tool round; pi will emit another agent_end after the next
+ *              completion, so we treat the *current* event as
+ *              persistable too (the final turn's stopReason will be
+ *              stop|error|aborted, and that's what gates the actual
+ *              window). Also persistable.
+ *   aborted  → user ESC. Skip: user explicitly rejected this output.
+ *   error    → upstream/network/protocol failure (e.g. sub2api SSE EOF).
+ *              Skip: the visible message is whatever bytes happened to
+ *              flush before the disconnect, often half a sentence or
+ *              an incomplete tool call. Even with retry-stream-eof.ts
+ *              auto-retrying, *this* agent_end fires once with the
+ *              broken message before the retry succeeds. Without this
+ *              skip, sediment would feed garbage to the writer agent
+ *              and either parse_failure (advancing checkpoint past the
+ *              real turn) or pollute memory.
+ *   length   → hit maxTokens. Skip: the assistant was mid-thought when
+ *              cut off; persisting a truncated argument or list yields
+ *              dangling references that confuse future reads. Rare in
+ *              practice (pi's defaults are generous).
+ *
+ * Reads `messages` off AgentEndEvent (not ctx.sessionManager) so we
+ * examine the exact set of messages that just completed, not whatever
+ * the session has accumulated since.
  */
-function wasAborted(messages: any[] | undefined): boolean {
-  if (!Array.isArray(messages)) return false;
+function shouldSkipForStopReason(messages: any[] | undefined): { skip: boolean; reason: string } {
+  if (!Array.isArray(messages)) return { skip: false, reason: "" };
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i];
-    if (m?.role === "assistant") {
-      return m.stopReason === "aborted";
-    }
+    if (m?.role !== "assistant") continue;
+    const sr = m.stopReason;
+    if (sr === "aborted") return { skip: true, reason: "aborted (user ESC)" };
+    if (sr === "error")   return { skip: true, reason: `error (${String(m.errorMessage ?? "unknown").slice(0, 80)})` };
+    if (sr === "length")  return { skip: true, reason: "length (maxTokens reached)" };
+    return { skip: false, reason: "" };
   }
-  return false;
+  return { skip: false, reason: "" };
 }
 
 function setStatus(ctx: any, key: string, value: string | undefined): void {
@@ -373,12 +397,19 @@ export default function piSediment(pi: ExtensionAPI) {
 
     if (!targets.pensieve && !targets.gbrain) return;
 
-    // ESC-aborted turn: user signalled this output is not what they want.
-    // Skip sediment so we don't persist rejected content to long-term memory.
-    // The conversation head still advances when the next turn completes;
-    // sediment will pick that up on the next agent_end.
-    if (wasAborted((event as any).messages)) {
-      logLine(ctx.cwd, `agent_end: aborted turn — skipping sediment`);
+    // Failed/aborted/truncated turn: skip sediment so we don't persist
+    // half-truths or user-rejected content to long-term memory. The
+    // conversation head still advances when the next *clean* turn
+    // completes; sediment will pick that up on the next agent_end.
+    //
+    // Notably this catches the upstream-EOF case: when sub2api drops the
+    // SSE stream mid-response, pi emits agent_end with stopReason=error
+    // *before* retry-stream-eof.ts's transparent auto-retry succeeds.
+    // Without this guard we'd sediment whatever half-byte flushed before
+    // the disconnect.
+    const skipCheck = shouldSkipForStopReason((event as any).messages);
+    if (skipCheck.skip) {
+      logLine(ctx.cwd, `agent_end: skipping sediment — ${skipCheck.reason}`);
       return;
     }
 
