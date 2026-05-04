@@ -198,8 +198,14 @@ async function processGbrain(
     return "processed";
   }
   if (result.kind === "parse_failure") {
-    logLine(window.projectRoot, `gbrain pipeline: parse failure (no retry; agent decided wrong)`);
-    return "failed";
+    // Treat as skip: the model's terminal output was malformed (no SKIP, no
+    // SKIP_DUPLICATE, no ## GBRAIN). Returning "failed" makes the scheduler
+    // retry the same window; with a deterministic prompt and the same source
+    // material the model will produce similar malformed output, burning
+    // minutes per retry. Advance the checkpoint and let future windows
+    // re-discover the insight if it's durable.
+    logLine(window.projectRoot, `gbrain pipeline: parse failure — dropping write, advancing checkpoint`);
+    return "processed";
   }
 
   // Auxiliary: enrich frontmatter with related[] from a cheap server search.

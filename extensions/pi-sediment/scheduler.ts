@@ -334,6 +334,38 @@ function tick(target: string): void {
     })
     .finally(() => {
       state.running = false;
+
+      // Hard retry cap: a deterministic failure (model output malformed for
+      // THIS window, sanitize hits, etc.) will reproduce on every retry and
+      // burn LLM minutes forever. After MAX_RETRIES, give up on this window
+      // by force-advancing the checkpoint to the pending head. Future windows
+      // can re-discover the insight if it's durable.
+      //
+      // Workers should normally return "processed" (success or skip) so we
+      // never reach this; the cap is a safety net for cases where a code
+      // path still returns "failed" that's actually deterministic.
+      const MAX_RETRIES = 5;
+      if ((state.retryCount ?? 0) >= MAX_RETRIES &&
+          state.pendingHeadEntryId !== state.lastProcessedEntryId) {
+        const dropped = state.pendingHeadEntryId;
+        state.lastProcessedEntryId = state.pendingHeadEntryId;
+        state.retryCount = 0;
+        state.lastError = `gave up after ${MAX_RETRIES} retries (last: ${state.lastError ?? "unknown"})`;
+        state.lastErrorAt = new Date().toISOString();
+        // Surface clearly in sidecar.log so the user sees the bail-out.
+        const projectRoot = state.latestSnapshot?.projectRoot;
+        if (projectRoot) {
+          try {
+            const dir = path.join(projectRoot, ".pi-sediment");
+            fs.mkdirSync(dir, { recursive: true });
+            fs.appendFileSync(
+              path.join(dir, "sidecar.log"),
+              `${new Date().toISOString()} scheduler ${target}: gave up after ${MAX_RETRIES} retries, force-advancing to ${dropped}\n`,
+            );
+          } catch { /* silent */ }
+        }
+      }
+
       persist(state, target);
       // If new content arrived while running, process the coalesced pending head.
       // On failure, keep the checkpoint unchanged but retry with backoff — no busy loop.

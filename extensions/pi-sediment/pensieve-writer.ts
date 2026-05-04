@@ -237,40 +237,55 @@ export async function writePensieve(
       .trim();
 
     const headerRegex = /^#{2,3}\s+PENSIEVE\s*$/mi;
+    // Parse failures from here on: the model's output is deterministically
+    // malformed for THIS window. Retrying the same window produces the same
+    // malformed output and burns minutes. Return "skipped" so the scheduler
+    // advances the checkpoint; future windows can re-attempt if the insight
+    // is durable.
     const headerMatch = clean.match(headerRegex);
     if (!headerMatch || headerMatch.index === undefined) {
-      // Log a snippet of what the model actually emitted so we can debug
-      // why it produced neither SKIP nor a ## PENSIEVE block.
       const snippet = clean.slice(0, 200).replace(/\s+/g, " ");
-      logLine(projectRoot, `${tag} parse:fail no ## PENSIEVE header head="${snippet}"`);
-      return "failed";
+      logLine(projectRoot, `${tag} parse:fail no ## PENSIEVE header — advancing checkpoint head="${snippet}"`);
+      return "skipped";
     }
 
     const bodyStart = headerMatch.index + headerMatch[0].length;
     // Keep the full section after ## PENSIEVE. The body may contain nested
     // ## headings; stopping at the next ## would silently truncate content.
     const raw = clean.slice(bodyStart).trim();
-    if (!raw) return "failed";
+    if (!raw) {
+      logLine(projectRoot, `${tag} parse:fail empty body — advancing checkpoint`);
+      return "skipped";
+    }
 
     const contentIdx = raw.search(/__CONTENT__/i);
     if (contentIdx === -1) {
-      logLine(projectRoot, `${tag} parse:fail no __CONTENT__`);
-      return "failed";
+      logLine(projectRoot, `${tag} parse:fail no __CONTENT__ — advancing checkpoint`);
+      return "skipped";
     }
 
     const header = raw.slice(0, contentIdx).trim();
     let content = raw.slice(contentIdx + "__CONTENT__".length).trim();
     if (!content || content.length < 100) {
-      logLine(projectRoot, `${tag} parse:fail content too short`);
-      return "failed";
+      logLine(projectRoot, `${tag} parse:fail content too short — advancing checkpoint`);
+      return "skipped";
     }
 
     content = content.replace(/^\n+/, "");
-    if (!content.startsWith("---")) return "failed";
-    if (!/^type:\s*(knowledge|decision|maxim)/m.test(content)) return "failed";
+    if (!content.startsWith("---")) {
+      logLine(projectRoot, `${tag} parse:fail content missing frontmatter — advancing checkpoint`);
+      return "skipped";
+    }
+    if (!/^type:\s*(knowledge|decision|maxim)/m.test(content)) {
+      logLine(projectRoot, `${tag} parse:fail content missing type — advancing checkpoint`);
+      return "skipped";
+    }
 
     const kind = extractField(header, "kind");
-    if (!kind || !["knowledge", "decision", "maxim"].includes(kind)) return "failed";
+    if (!kind || !["knowledge", "decision", "maxim"].includes(kind)) {
+      logLine(projectRoot, `${tag} parse:fail invalid kind="${kind}" — advancing checkpoint`);
+      return "skipped";
+    }
 
     const slug = sanitizeSlug(extractField(header, "slug") || kind);
     const label = extractField(header, "label") || slug;
