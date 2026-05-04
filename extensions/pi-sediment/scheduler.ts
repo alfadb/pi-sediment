@@ -20,6 +20,13 @@ export interface BranchSnapshot {
   projectRoot: string;
   headEntryId: string;
   entries: any[];
+  /**
+   * Live model registry from the most recent agent_end ctx.
+   * MUST come from the ctx passed to the agent_end handler — not from a
+   * captured session_start ctx. Captured ctx becomes stale after
+   * session replacement/reload, and even property access on it throws.
+   */
+  modelRegistry: any;
 }
 
 export interface RunWindow {
@@ -33,6 +40,8 @@ export interface RunWindow {
   sourceDateIso?: string;
   text: string;
   entryCount: number;
+  /** Live model registry, refreshed each markPending(). See BranchSnapshot. */
+  modelRegistry: any;
 }
 
 type WorkerFn = (window: RunWindow) => Promise<RunResult>;
@@ -192,6 +201,7 @@ function buildRunWindow(target: string, state: TargetState): RunWindow | null {
     sourceDateIso,
     text,
     entryCount: windowEntries.length,
+    modelRegistry: snapshot.modelRegistry,
   };
 }
 

@@ -242,42 +242,61 @@ export default function piSediment(pi: ExtensionAPI) {
     gbrain: false,
     gbrainPageCount: null,
   };
+  // Live ctx, refreshed on session_start and agent_end. Workers reference
+  // this via closure; setStatus is defensive against staleness anyway.
+  let lastCtx: any = null;
 
   pi.on("session_start", async (_event: SessionStartEvent, ctx) => {
     targets = await detectTargets(ctx.cwd);
 
     setStatus(ctx, STATUS_LEGACY, undefined);
 
+    // CRITICAL: worker closures must NOT capture `ctx`. The ctx supplied to
+    // session_start becomes stale once the host swaps sessions (newSession,
+    // fork, switchSession, reload), and any property access on a stale ctx
+    // throws. Workers run inside the scheduler's promise chain, so a throw
+    // there is interpreted as worker failure — retryCount climbs forever
+    // even though the actual write may have succeeded on a previous tick.
+    //
+    // Instead, we read modelRegistry off `window`, which is rebuilt from the
+    // most recent agent_end ctx (see markPending below). Status writes use
+    // module-level `lastCtx`, refreshed on every agent_end.
+    lastCtx = ctx;
+
     if (targets.pensieve) {
-      setStatus(ctx, STATUS_PENSIEVE, undefined);
+      setStatus(lastCtx, STATUS_PENSIEVE, undefined);
       registerScheduler("pensieve", async (window: RunWindow) => {
-        setStatus(ctx, STATUS_PENSIEVE, "⏳ Pz");
+        setStatus(lastCtx, STATUS_PENSIEVE, "⏳ Pz");
         try {
-          return await processPensieve(window, ctx.modelRegistry);
+          return await processPensieve(window, window.modelRegistry);
         } finally {
-          setStatus(ctx, STATUS_PENSIEVE, undefined);
+          setStatus(lastCtx, STATUS_PENSIEVE, undefined);
         }
       });
     } else {
-      setStatus(ctx, STATUS_PENSIEVE, undefined);
+      setStatus(lastCtx, STATUS_PENSIEVE, undefined);
     }
 
     if (targets.gbrain) {
-      setStatus(ctx, STATUS_GBRAIN, undefined);
+      setStatus(lastCtx, STATUS_GBRAIN, undefined);
       registerScheduler("gbrain", async (window: RunWindow) => {
-        setStatus(ctx, STATUS_GBRAIN, "⏳ Gb");
+        setStatus(lastCtx, STATUS_GBRAIN, "⏳ Gb");
         try {
-          return await processGbrain(window, targets, ctx.modelRegistry);
+          return await processGbrain(window, targets, window.modelRegistry);
         } finally {
-          setStatus(ctx, STATUS_GBRAIN, undefined);
+          setStatus(lastCtx, STATUS_GBRAIN, undefined);
         }
       });
     } else {
-      setStatus(ctx, STATUS_GBRAIN, undefined);
+      setStatus(lastCtx, STATUS_GBRAIN, undefined);
     }
   });
 
   pi.on("agent_end", async (_event: AgentEndEvent, ctx) => {
+    // Refresh module-level live ctx so worker setStatus calls don't touch a
+    // stale session_start ctx.
+    lastCtx = ctx;
+
     if (!targets.pensieve && !targets.gbrain) return;
 
     const branch = ctx.sessionManager.getBranch();
@@ -289,6 +308,9 @@ export default function piSediment(pi: ExtensionAPI) {
       projectRoot: ctx.cwd,
       headEntryId: head.id,
       entries: branch,
+      // Snapshot the live registry; workers will use this instead of any
+      // ctx captured at session_start (which would be stale after reloads).
+      modelRegistry: ctx.modelRegistry,
     };
 
     if (targets.pensieve) {
