@@ -132,8 +132,13 @@ function parseGbrainAgentOutput(text: string, projectRoot: string): GbrainAgentR
     }
   }
 
+  // Sanitize. On hit treat as skip (not parse_failure): a parse_failure
+  // makes the scheduler retry the same window, which will produce similar
+  // content and trip the filter again. Drop the write and advance the
+  // checkpoint; future windows can re-discover the insight.
   if (!sanitizeContent(content)) {
-    return { kind: "parse_failure", rawText: text };
+    logLine(projectRoot, `gbrain-agent sanitize:reject — dropping write, advancing checkpoint`);
+    return { kind: "skip" };
   }
 
   return {

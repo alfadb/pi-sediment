@@ -7,17 +7,33 @@
 
 import type { GbrainSearchResult } from "./types.js";
 
-// ── Injection filter patterns (from gstack) ─────────────────────
+// ── Injection filter patterns ────────────────────────────────
 
+// Last-line defense before sediment writes pensieve / gbrain. Threat:
+// indirect prompt injection — a coding-agent turn may quote untrusted data
+// (web pages, tool output, pasted text) containing instructions which a
+// downstream sediment LLM could be persuaded by, leading sediment to
+// permanently install poisoned content into long-term memory.
+//
+// Defense layers (sediment is already hardened by all three):
+//   1. lookup tools are read-only — no write tools exposed to the model
+//   2. final writes go through a parsed protocol (## PENSIEVE / ## GBRAIN),
+//      not arbitrary tool calls
+//   3. this content sanitize — last-line catch of the most overt patterns
+//
+// Originally we copied a wide pattern set from pi-gstack including bare
+// '\bsystem:' / '\buser:' / '\bassistant:'. Those are vocabulary that
+// appears constantly in normal technical writing about prompt design and
+// agent loops; they produced 100% false-positive rate during meta-discussion
+// of pi-sediment itself (3 hits in one session, all on legitimate prose).
+// The remaining patterns target unambiguous imperative phrasings that have
+// no natural use in engineering prose.
 export const INJECTION_PATTERNS: RegExp[] = [
   /ignore\s+(all\s+)?previous\s+(instructions|context|rules)/i,
   /you\s+are\s+now\s+/i,
   /always\s+output\s+no\s+findings/i,
   /skip\s+(all\s+)?(security|review|checks)/i,
   /override[:\s]/i,
-  /\bsystem\s*:/i,
-  /\bassistant\s*:/i,
-  /\buser\s*:/i,
   /do\s+not\s+(report|flag|mention)/i,
   /approve\s+(all|every|this)/i,
 ];

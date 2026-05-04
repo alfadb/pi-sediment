@@ -100,6 +100,10 @@ function extractGbrainOutput(text: string, projectRoot: string): { output: Gbrai
   if (!tags.includes("engineering")) tags.unshift("engineering");
 
   // ── Step 6: sanitize ──
+  // Note: this writer.ts is the legacy two-stage path; the main pipeline
+  // now goes through gbrain-agent.ts which treats sanitize failures as
+  // skip (advance checkpoint, no retry). Keeping the legacy behavior here
+  // since this code path is dormant in normal operation.
   if (!sanitizeContent(content)) {
     saveParseFailure(raw, projectRoot, "injection");
     return null;

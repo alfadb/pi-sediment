@@ -277,10 +277,14 @@ export async function writePensieve(
     const mode = (extractField(header, "mode") ?? "new").toLowerCase();
     const updatePathRaw = extractField(header, "update_path");
 
-    // Sanitize
+    // Sanitize. On hit return "skipped", not "failed": the model decided
+    // (correctly or not) the topic warrants a write, but the content tripped
+    // the injection filter. Retrying the same window will produce similar
+    // content and trip again — wasted minutes for no progress. Skip and
+    // advance the checkpoint; future windows can re-discover the insight.
     if (!sanitizeContent(content)) {
-      logLine(projectRoot, `${tag} parse:fail injection`);
-      return "failed";
+      logLine(projectRoot, `${tag} sanitize:reject — dropping write, advancing checkpoint`);
+      return "skipped";
     }
 
     // ── Write to Pensieve ──────────────────────────────────
