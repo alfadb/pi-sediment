@@ -51,8 +51,16 @@ const STATUS_GBRAIN = "pi-sediment-gbrain";
 const STATUS_LEGACY = "pi-sediment";
 
 function setStatus(ctx: any, key: string, value: string | undefined): void {
-  if (!ctx.hasUI) return;
-  try { ctx.ui.setStatus(key, value); } catch { /* print/rpc mode */ }
+  // Defensive: ctx may be stale (session replaced/reloaded since session_start
+  // captured this closure). Even reading ctx.hasUI on a stale ctx throws —
+  // so the guard must live INSIDE the try, not outside it. If this throws in
+  // a worker's finally{} block, the whole promise rejects and the scheduler
+  // re-runs the same window (causing duplicate writes + ever-growing
+  // retryCount in .pi-sediment/state.json).
+  try {
+    if (!ctx?.hasUI) return;
+    ctx.ui.setStatus(key, value);
+  } catch { /* stale ctx / print / rpc mode */ }
 }
 
 // ── gbrain translation (non-Latin → English) ────────────────────

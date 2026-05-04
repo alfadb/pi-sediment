@@ -28,9 +28,24 @@ function detectPensieve(projectRoot: string): boolean {
 // ── gbrain detection ───────────────────────────────────────────
 
 interface GbrainDoctor {
+  schema_version?: number;
   status?: string;
   health_score?: number;
   page_count?: number;
+  checks?: Array<{ name?: string; status?: string; message?: string }>;
+}
+
+/**
+ * Schema-v1 returned a top-level `page_count`. Schema-v2 (gbrain v0.25+)
+ * dropped it; the count now only appears inside the connection check's
+ * message text, e.g. "Connected, 68 pages". Parse both shapes so the
+ * status-bar page count keeps working across upstream versions.
+ */
+function extractPageCount(doc: GbrainDoctor): number | null {
+  if (doc.page_count != null) return Number(doc.page_count);
+  const msg = doc.checks?.find((c) => c.name === "connection")?.message;
+  const m = msg?.match(/(\d+)\s+pages?/);
+  return m ? Number(m[1]) : null;
 }
 
 async function detectGbrain(): Promise<{ available: boolean; pageCount: number | null }> {
@@ -43,8 +58,7 @@ async function detectGbrain(): Promise<{ available: boolean; pageCount: number |
     });
     if (!stdout) return { available: false, pageCount: null };
     const doc = JSON.parse(stdout.trim()) as GbrainDoctor;
-    const pageCount = doc.page_count != null ? Number(doc.page_count) : null;
-    return { available: true, pageCount };
+    return { available: true, pageCount: extractPageCount(doc) };
   } catch {
     return { available: false, pageCount: null };
   }
