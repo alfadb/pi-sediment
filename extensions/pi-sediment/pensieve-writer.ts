@@ -18,20 +18,64 @@ import type { ResolvedModel } from "./types.js";
 
 // ── Prompt ─────────────────────────────────────────────────────
 
-const PENSIEVE_PROMPT = `You are the pi-sediment Pensieve writer.
+const PENSIEVE_PROMPT = `You are the pi-sediment Pensieve curator.
 
-Read the assistant message below and decide whether it contains a project-specific
-insight worth saving to Pensieve. Pensieve stores file paths, module boundaries,
-call chains, architectural decisions, and project conventions.
+Your job: decide whether a coding-agent turn produced a project-specific
+insight worth persisting to .pensieve/, and if so, AVOID DUPLICATING what's
+already there. Pensieve stores file paths, module boundaries, call chains,
+architectural decisions, and project conventions — anything that is true
+for THIS project and would help future work on it.
 
-If the message is NOT worth saving (routine execution, status update, user question,
-already-known fact), output exactly:
+WORKFLOW:
+  1. Read the assistant turn provided by the user.
+  2. Use the read-only tools to investigate existing memory:
+       - pensieve_grep, pensieve_read, pensieve_list — inspect .pensieve/
+       - gbrain_search, gbrain_get — cross-reference cross-project memory
+     Call them as many times as you need. Be thorough: check whether an
+     existing entry already states this fact, or covers the same TOPIC and
+     should be updated rather than duplicated.
+  3. Emit ONE final terminal output. After emitting it, stop — do not call
+     any more tools.
 
+FOUR POSSIBLE TERMINAL OUTPUTS:
+
+A. No durable insight — emit exactly:
 SKIP
 
-If it IS worth saving, output a Pensieve entry:
+B. An existing Pensieve entry already covers this fact and the new material
+   adds nothing. Emit exactly one line:
+SKIP_DUPLICATE: <existing-relPath-under-.pensieve> — <one-sentence reason>
+
+C. UPDATE an existing entry (same topic, refined / contradicted / extended /
+   superseded). Emit a ## PENSIEVE block with mode:update and update_path:
 
 ## PENSIEVE
+mode: update
+update_path: <relative path under .pensieve/, e.g. short-term/decisions/2026-05-04-foo.md>
+kind: knowledge | decision | maxim
+slug: <existing-slug, do NOT rename>
+label: <= 60 char headline
+__CONTENT__
+---
+type: {kind}
+title: {one-line title}
+id: {existing-slug}
+status: active
+created: <ORIGINAL created date from the existing entry, verbatim>
+updated: {today}
+tags: [tag1, tag2]
+---
+
+# Title
+
+Full rewritten body (>= 100 words). Incorporate the new insight; do not
+blindly duplicate paragraphs from the original. Preserve any timeline
+bullets if the file uses a Timeline section.
+
+D. NEW entry (genuinely a different topic). Emit:
+
+## PENSIEVE
+mode: new
 kind: knowledge | decision | maxim
 slug: lowercase-hyphenated-slug
 label: <= 60 char headline
@@ -41,22 +85,25 @@ type: {kind}
 title: {one-line title}
 id: {slug}
 status: active
-created: {date}
-updated: {date}
+created: {today}
+updated: {today}
 tags: [tag1, tag2]
 ---
 
 # Title
 
-Body content with file paths and module names (>= 100 words).
+Body (>= 100 words) including file paths and module names.
 
 RULES:
 - kind: "maxim" for hard rules, "decision" for architectural tradeoffs, "knowledge" for facts
-- slug lowercase hyphenated, no special chars
-- label <= 60 chars, human-readable
+- slug: lowercase hyphenated, no special chars
+- For mode=update: do NOT change slug or kind from the existing entry; do NOT
+  replace the original 'created:' value
 - Include file paths and module names in body
-- Output SKIP (nothing else) if the message has no durable insight
-- Output the full entry if it does`;
+- Default to UPDATE when an existing entry is on the same topic. Default to
+  SKIP_DUPLICATE when the new material adds no value. NEW only for genuinely
+  new topics. Churn is worse than gaps.
+- Output exactly ONE of {SKIP, SKIP_DUPLICATE: ..., ## PENSIEVE ...}, then stop.`;
 
 // ── Locate skill root ──────────────────────────────────────────
 
@@ -212,6 +259,8 @@ export async function writePensieve(
 
     const slug = sanitizeSlug(extractField(header, "slug") || kind);
     const label = extractField(header, "label") || slug;
+    const mode = (extractField(header, "mode") ?? "new").toLowerCase();
+    const updatePathRaw = extractField(header, "update_path");
 
     // Sanitize
     if (!sanitizeContent(content)) {
@@ -223,32 +272,59 @@ export async function writePensieve(
     const pensieveDir = path.join(projectRoot, ".pensieve");
     if (!fs.existsSync(pensieveDir)) return "failed";
 
-    let target: string;
-    if (kind === "knowledge") {
-      const dir = path.join(pensieveDir, "short-term", "knowledge", slug);
-      fs.mkdirSync(dir, { recursive: true });
-      target = path.join(dir, "content.md");
-    } else if (kind === "decision") {
-      const dir = path.join(pensieveDir, "short-term", "decisions");
-      fs.mkdirSync(dir, { recursive: true });
-      target = path.join(dir, `${dateIso}-${slug}.md`);
-    } else {
-      const dir = path.join(pensieveDir, "short-term", "maxims");
-      fs.mkdirSync(dir, { recursive: true });
-      target = path.join(dir, `${slug}.md`);
+    let target: string | undefined;
+    let isUpdate = false;
+
+    // mode=update: overwrite the existing file at update_path. Path must
+    // resolve safely under .pensieve/ and the file must already exist;
+    // otherwise fall through to NEW behavior so we don't silently lose work.
+    if (mode === "update" && updatePathRaw) {
+      const cleaned = updatePathRaw.replace(/^\.?pensieve[/\\]/, "");
+      const candidate = path.resolve(pensieveDir, cleaned);
+      const within = candidate.startsWith(pensieveDir + path.sep);
+      if (within && fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
+        target = candidate;
+        isUpdate = true;
+      } else {
+        logLine(projectRoot, `${tag} update_path:invalid path="${updatePathRaw}" (within=${within} exists=${fs.existsSync(candidate)}) — falling back to NEW`);
+      }
     }
 
-    // Avoid overwrite
-    let final = target;
-    let i = 2;
-    while (fs.existsSync(final)) {
-      const ext = path.extname(target);
-      const base = target.slice(0, -ext.length);
-      final = `${base}-${i}${ext}`;
-      i++;
-      if (i > 50) break;
+    if (!isUpdate) {
+      if (kind === "knowledge") {
+        const dir = path.join(pensieveDir, "short-term", "knowledge", slug);
+        fs.mkdirSync(dir, { recursive: true });
+        target = path.join(dir, "content.md");
+      } else if (kind === "decision") {
+        const dir = path.join(pensieveDir, "short-term", "decisions");
+        fs.mkdirSync(dir, { recursive: true });
+        target = path.join(dir, `${dateIso}-${slug}.md`);
+      } else {
+        const dir = path.join(pensieveDir, "short-term", "maxims");
+        fs.mkdirSync(dir, { recursive: true });
+        target = path.join(dir, `${slug}.md`);
+      }
+    }
+
+    let final = target!;
+    if (!isUpdate) {
+      // Avoid clobbering an existing file by appending -2, -3, ...
+      // In the agent-loop era hitting this means the model failed to detect
+      // a duplicate it should have UPDATEd — keep but log as a smell.
+      let i = 2;
+      while (fs.existsSync(final)) {
+        const ext = path.extname(target!);
+        const base = target!.slice(0, -ext.length);
+        final = `${base}-${i}${ext}`;
+        i++;
+        if (i > 50) break;
+      }
+      if (final !== target) {
+        logLine(projectRoot, `${tag} write:smell slug-collision target=${path.relative(projectRoot, target!)} final=${path.relative(projectRoot, final)}`);
+      }
     }
     fs.writeFileSync(final, content, "utf8");
+    logLine(projectRoot, `${tag} write:${isUpdate ? "update" : "new"} path=${path.relative(projectRoot, final)}`);
 
     // Refresh project state
     const skillRoot = getSkillRoot();

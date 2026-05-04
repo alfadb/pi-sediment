@@ -148,7 +148,11 @@ export async function writeToGbrain(
   entry: GbrainWriteOutput,
   projectRoot: string,
 ): Promise<boolean> {
-  const slug = sanitizeSlug(entry.title);
+  // UPDATE mode: writer chose to overwrite a specific existing slug.
+  // Honor it verbatim so gbrain put's upsert semantics overwrite the existing
+  // page in place (preserving identity and inbound graph links).
+  // NEW mode: derive slug from title.
+  const slug = entry.updateSlug || sanitizeSlug(entry.title);
   if (!slug) {
     logLine(projectRoot, `gbrain write:skip slug=empty title="${entry.title.slice(0, 80)}"`);
     return false;

@@ -24,13 +24,7 @@ import {
   type RunWindow,
   type SchedulerPhase,
 } from "./scheduler.js";
-import { evaluateForGbrain } from "./evaluator.js";
-import {
-  writeForGbrain,
-  isParseFailure,
-  buildFormatError,
-  type WriteResult,
-} from "./writer.js";
+import { runGbrainAgent } from "./gbrain-agent.js";
 import {
   searchGbrainForLinks,
   writeToGbrainWithRetry,
@@ -39,7 +33,7 @@ import {
 import { writePensieve } from "./pensieve-writer.js";
 import { loadConfig } from "./config.js";
 import { completeSimple } from "@mariozechner/pi-ai";
-import type { TargetStatus, GbrainWriteInput } from "./types.js";
+import type { TargetStatus } from "./types.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
@@ -178,8 +172,6 @@ async function translateGbrainEntry(
 
 // ── gbrain pipeline (with parse:fail retry) ────────────────────
 
-const MAX_GBRAIN_RETRIES = 2;
-
 async function processGbrain(
   window: RunWindow,
   targets: TargetStatus,
@@ -187,54 +179,44 @@ async function processGbrain(
 ): Promise<RunResult> {
   logLine(window.projectRoot, `gbrain window: entries=${window.entryCount} from=${window.fromEntryId ?? "START"} to=${window.toEntryId}`);
 
-  // 1. Evaluate the whole checkpoint window.
-  const evalResult = await evaluateForGbrain(
-    window.text,
-    targets,
-    window.projectRoot,
-    registry,
-    undefined,
-  );
-
-  if (evalResult.decision === "skip") return "processed";
-
-  // 2. Search related pages.
-  const relatedPages = await searchGbrainForLinks(evalResult.summary, window.projectRoot);
-
-  // 3. Write with retry on parse failure. Use the source conversation
-  // timestamp, not writer wall-clock time; retries/backoff may run later.
   const dateIso = window.sourceDateIso ?? new Date().toISOString().slice(0, 10);
-  let writeInput: GbrainWriteInput = {
-    summary: evalResult.summary,
-    dateIso,
+
+  // The agent does eval + write in a single tool-using loop; it self-checks
+  // existing memory via lookup tools (gbrain_search/get, pensieve_grep/read)
+  // and decides skip / skip_duplicate / update / new.
+  const result = await runGbrainAgent({
     lastAssistantMessage: window.text,
-    relatedPages,
-  };
+    dateIso,
+    targets,
+    projectRoot: window.projectRoot,
+    registry,
+  });
 
-  let writeResult: WriteResult | null = null;
-  for (let attempt = 0; attempt <= MAX_GBRAIN_RETRIES; attempt++) {
-    writeResult = await writeForGbrain(writeInput, window.projectRoot, registry);
-    if (!writeResult) {
-      logLine(window.projectRoot, `gbrain pipeline: write failed (API error/abort) attempt=${attempt}`);
-      return "failed";
-    }
-    if (!isParseFailure(writeResult)) break;
-
-    const formatError = buildFormatError(writeResult.rawText);
-    writeInput = { ...writeInput, formatError };
-    logLine(window.projectRoot, `gbrain pipeline: parse fail, retry ${attempt + 1}/${MAX_GBRAIN_RETRIES}`);
+  if (result.kind === "skip") return "processed";
+  if (result.kind === "skip_duplicate") {
+    logLine(window.projectRoot, `sediment done: gbrain=skip_duplicate`);
+    return "processed";
   }
-
-  if (!writeResult || isParseFailure(writeResult)) {
-    logLine(window.projectRoot, `gbrain pipeline: parse fail exhausted retries`);
+  if (result.kind === "parse_failure") {
+    logLine(window.projectRoot, `gbrain pipeline: parse failure (no retry; agent decided wrong)`);
     return "failed";
   }
 
-  // 4. Write to gbrain CLI.
+  // Auxiliary: enrich frontmatter with related[] from a cheap server search.
+  // The agent picks the slug (NEW or UPDATE); related[] is metadata only.
+  const relatedPages = await searchGbrainForLinks(result.output.title, window.projectRoot);
+  const relatedTitles = relatedPages
+    .map((p) => p.title.replace(/^#+\s*/, "").replace(/\s+/g, " ").trim())
+    .filter((t) => Boolean(t) && t !== result.output.title)
+    .slice(0, 5);
+  const enriched = relatedTitles.length > 0
+    ? { ...result.output, related: relatedTitles }
+    : result.output;
+
   const translateFn: GbrainTranslateFn = async (entry, attempt) =>
     translateGbrainEntry(entry, window.projectRoot, registry);
 
-  const ok = await writeToGbrainWithRetry(writeResult.output, window.projectRoot, translateFn);
+  const ok = await writeToGbrainWithRetry(enriched, window.projectRoot, translateFn);
   logLine(window.projectRoot, `sediment done: gbrain=${ok ? "✓" : "✗"}`);
   return ok ? "processed" : "failed";
 }

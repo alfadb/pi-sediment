@@ -47,6 +47,13 @@ export interface GbrainWriteOutput {
   content: string; // markdown body
   /** Related page titles for gbrain frontmatter auto-link extraction. */
   related?: string[];
+  /**
+   * Set when the writer chose to UPDATE an existing page in place.
+   * gbrain put is upsert by slug, so passing this overrides the
+   * sanitizeSlug(title) derivation and overwrites the existing page
+   * (preserving its identity and inbound graph links).
+   */
+  updateSlug?: string;
 }
 
 // ── Resolved model ─────────────────────────────────────────────
