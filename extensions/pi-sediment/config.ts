@@ -2,12 +2,18 @@
  * pi-sediment config — model resolution.
  *
  * Default model: deepseek/deepseek-v4-pro
- * Default reasoning: xhigh
+ * Default reasoning: high
  *
  * Override priority (high → low):
  *   1. env: PI_SEDIMENT_MODEL / PI_SEDIMENT_REASONING
  *   2. project: .pi-sediment/config.json → model / reasoning
- *   3. default: deepseek/deepseek-v4-pro / xhigh
+ *   3. default: deepseek/deepseek-v4-pro / high
+ *
+ * Reasoning was xhigh during the single-call era when the model had to do all
+ * eval-and-write reasoning in one shot. With the agent loop the model
+ * iterates with tool feedback, so each turn needs less depth; xhigh on every
+ * turn doubled wallclock for negligible quality gain (observed: 2.5 min per
+ * SKIP decision with 5-8 turns, vs ~30s on high).
  *
  * Hot-reloaded on every agent_end so users can tweak without restart.
  */
@@ -34,7 +40,7 @@ const DEFAULT_MODEL: ModelRef = {
   modelId: "deepseek-v4-pro",
 };
 
-const DEFAULT_REASONING: ReasoningLevel = "xhigh";
+const DEFAULT_REASONING: ReasoningLevel = "high";
 
 // ── Helpers ────────────────────────────────────────────────────
 
