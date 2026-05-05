@@ -145,21 +145,100 @@ function saveTarget(projectRoot: string, target: string, patch: TargetDiskState)
 }
 
 // ── Window formatting ─────────────────────────────────────────
+//
+// Sediment's writer agents only consume what survives serialization here.
+// Three classes of session content matter:
+//
+//   text       — the assistant's prose answer; verbatim what the user saw
+//   toolCall   — the assistant's tool invocation: name + arguments
+//   toolResult — the tool's response, fed back into the next LLM turn
+//
+// One class is intentionally NOT preserved:
+//
+//   thinking   — model-private chain-of-thought reasoning
+//
+// Why drop thinking?
+//   - Anthropic models (opus/sonnet) ship thinking as opaque encrypted blobs
+//     when accessed via the sub2api/codex path; the local session contains
+//     only `thinkingSignature` (a 364-byte server-side ciphertext) and an
+//     EMPTY `thinking` string. There is literally nothing to forward.
+//   - DeepSeek models ship thinking as plaintext, but it can be 1-3x the
+//     size of the final text — a 250K-char session balloons to 800K+ if
+//     thinking is included. Sediment would burn tokens on draft reasoning.
+//   - Thinking is exploratory: "maybe X? no, Y; actually Z" — the wrong
+//     half is as visible as the right half. The final text already encodes
+//     the conclusions; thinking is the discarded scaffolding.
+//   - Treating sediment as model-agnostic means relying only on what every
+//     provider exposes consistently, which is text + tool I/O.
+//
+// What about the redacted/encrypted thinking signature? That field exists
+// SOLELY for round-trip continuity inside one LLM provider's API — it lets
+// a multi-turn anthropic call re-attach prior thinking when sending the
+// next request. It cannot be decrypted client-side, cannot be summarized,
+// and contains no information sediment can use. Skip it cleanly.
 
 function contentToText(content: unknown): string {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
   const parts: string[] = [];
   for (const block of content as any[]) {
-    if (block?.type === "text" && typeof block.text === "string") parts.push(block.text);
+    if (!block || typeof block !== "object") continue;
+    if (block.type === "text" && typeof block.text === "string") {
+      parts.push(block.text);
+    } else if (block.type === "toolCall") {
+      // Format: a single-line header for diff-friendly logs, then the
+      // arguments JSON pretty-printed if small or single-line if large.
+      // Sediment writers care about *what tool ran with what args*, not
+      // the formatting; preserve verbatim args so a write/edit/grep is
+      // reconstructable from the window.
+      const name = block.name ?? "unknown";
+      let argsRepr: string;
+      try {
+        const json = JSON.stringify(block.arguments ?? {});
+        argsRepr = json.length > 400
+          ? JSON.stringify(block.arguments ?? {}, null, 2)
+          : json;
+      } catch {
+        argsRepr = "(unserializable arguments)";
+      }
+      parts.push(`[tool_call ${name}] ${argsRepr}`);
+    } else if (block.type === "image") {
+      // Don't dump base64 — a single image is megabytes and serves no
+      // purpose for sediment's text-based knowledge extraction.
+      parts.push(`[image ${block.mimeType ?? "unknown"}]`);
+    }
+    // Skip thinking blocks (see header comment for rationale).
   }
   return parts.join("\n");
 }
 
+/**
+ * Render a tool's result inline. ToolResultMessage carries content that's
+ * the tool's actual output — a bash command's stdout, an edit's diff, a
+ * read's file contents. This is where most signal lives for sediment:
+ * "the assistant ran X and got Y, then said Z".
+ */
+function toolResultToText(msg: any): string {
+  const name = msg?.toolName ?? "unknown";
+  const errFlag = msg?.isError ? " ERROR" : "";
+  const body = contentToText(msg?.content).trim();
+  return `[tool_result ${name}${errFlag}]\n${body}`;
+}
+
 function entryToText(entry: any): string | null {
   if (entry.type === "message") {
-    const role = entry.message?.role ?? "message";
-    const text = contentToText(entry.message?.content).trim();
+    const msg = entry.message;
+    const role = msg?.role ?? "message";
+
+    // Tool results live in their own message role in pi-ai. Render them
+    // as a labeled block so writers can correlate tool_call → tool_result.
+    if (role === "toolResult") {
+      const body = toolResultToText(msg).trim();
+      if (!body) return null;
+      return `### toolResult (${entry.id})\n${body}`;
+    }
+
+    const text = contentToText(msg?.content).trim();
     if (!text) return null;
     return `### ${role} (${entry.id})\n${text}`;
   }
@@ -181,8 +260,18 @@ function entryToText(entry: any): string | null {
   return null;
 }
 
-const MAX_ENTRY_CHARS = 12_000;
-const MAX_WINDOW_CHARS = 80_000;
+// Per-entry cap: bash output / file reads can be enormous. 30K chars is
+// generous for typical tool results while still preventing a single read
+// of a 1MB file from monopolizing the window.
+const MAX_ENTRY_CHARS = 30_000;
+
+// Window cap: at ~4 chars/token this is ~50K tokens of session content,
+// which fits comfortably in any modern model's context (opus has 200K,
+// gpt-5.5 has 400K, deepseek-v4 has 128K). Tool I/O often dwarfs prose
+// by 4-5x in tool-heavy sessions — verified May 2026: text 181K chars,
+// tool args 793K chars. The previous 80K cap was tuned for text-only
+// extraction and clipped 80% of the actual signal.
+const MAX_WINDOW_CHARS = 200_000;
 
 function buildWindowText(entries: any[]): string {
   const chunks: string[] = [];
@@ -192,7 +281,14 @@ function buildWindowText(entries: any[]): string {
     let text = entryToText(entry);
     if (!text) continue;
     if (text.length > MAX_ENTRY_CHARS) {
-      text = text.slice(0, MAX_ENTRY_CHARS) + "\n[...entry truncated...]";
+      // Tool results often have their interesting bits at both ends —
+      // command at the top, exit code/error at the bottom — so head+tail
+      // truncation preserves more signal than head-only.
+      const headSize = Math.floor(MAX_ENTRY_CHARS * 0.7);
+      const tailSize = MAX_ENTRY_CHARS - headSize - 50;
+      text = text.slice(0, headSize) +
+        `\n[...${text.length - MAX_ENTRY_CHARS} chars elided...]\n` +
+        text.slice(-tailSize);
     }
     if (total + text.length > MAX_WINDOW_CHARS) {
       chunks.push("[...window truncated due to size...]");
