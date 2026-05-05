@@ -13,7 +13,37 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-export type RunResult = "processed" | "failed";
+/**
+ * Result returned by a worker for one window.
+ *
+ *   "processed"          — success, skip, or a deterministic outcome that
+ *                          should NEVER be retried (parse_failure,
+ *                          sanitize_reject, skip_duplicate, blocked
+ *                          non-Latin write, etc.). The scheduler advances
+ *                          the checkpoint and resets retryCount.
+ *   "failed_retryable"   — transient failure (network error, rate-limit,
+ *                          provider 5xx, model timeout). Retry with
+ *                          exponential backoff; do NOT count toward the
+ *                          deterministic-failure cap (otherwise a 10-minute
+ *                          provider outage would force-advance a real
+ *                          insight off the checkpoint within ~2 minutes
+ *                          of retries).
+ *   "failed_permanent"   — deterministic worker failure (model not in
+ *                          registry, auth permanently broken, exception
+ *                          thrown by worker code). Force-advance the
+ *                          checkpoint immediately — retrying produces the
+ *                          exact same failure and burns LLM budget.
+ *
+ * Workers MUST classify their failures. Returning the legacy "failed"
+ * string is preserved as an alias for failed_retryable, so old workers
+ * keep working but log a deprecation note. Once all workers migrate,
+ * remove the alias.
+ */
+export type RunResult =
+  | "processed"
+  | "failed_retryable"
+  | "failed_permanent"
+  | "failed"; // legacy alias for failed_retryable
 
 export interface BranchSnapshot {
   sessionId: string;
@@ -130,7 +160,22 @@ function readDisk(projectRoot: string): DiskState {
 function writeDisk(projectRoot: string, state: DiskState): void {
   const dir = path.join(projectRoot, ".pi-sediment");
   fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(statePath(projectRoot), JSON.stringify(state, null, 2) + "\n", "utf8");
+  // Atomic write: serialize, write to a sibling .tmp file, then rename.
+  // POSIX rename is atomic within a single filesystem, so a power loss
+  // either leaves the previous state.json intact or atomically swaps in
+  // the new one — never a half-written JSON. Without this, an interrupted
+  // writeFileSync corrupts state.json; readDisk's catch-all returns an
+  // empty state; sediment then re-processes every past entry in the
+  // session as if it were new (verified failure mode — 30+ duplicate LLM
+  // agent loops + duplicate gbrain pages on restart after a crash).
+  //
+  // The serialize step happens first so an in-memory JSON.stringify error
+  // (cyclic ref, etc.) doesn't trash the existing file via an empty .tmp.
+  const finalPath = statePath(projectRoot);
+  const tmpPath = `${finalPath}.tmp.${process.pid}`;
+  const payload = JSON.stringify(state, null, 2) + "\n";
+  fs.writeFileSync(tmpPath, payload, "utf8");
+  fs.renameSync(tmpPath, finalPath);
 }
 
 function loadTarget(projectRoot: string, target: string): TargetDiskState {
@@ -274,16 +319,29 @@ const MAX_ENTRY_CHARS = 30_000;
 const MAX_WINDOW_CHARS = 200_000;
 
 function buildWindowText(entries: any[]): string {
-  const chunks: string[] = [];
+  // Build BACKWARD from the newest entry. The window is anchored at
+  // pendingHeadEntryId (the assistant turn that JUST triggered sediment),
+  // and that turn is what the writer agent must see to make a decision.
+  //
+  // Original implementation iterated forward; when MAX_WINDOW_CHARS was
+  // hit, it `break`-ed and the most recent (= triggering) turn was silently
+  // omitted. Verified failure mode: a tool-heavy session with 200K of bash
+  // output earlier in the branch would push the trailing "insight" turn
+  // out of the window entirely, and sediment would emit SKIP with no
+  // visibility into why.
+  //
+  // Backward iteration with a prepend buffer guarantees the newest turns
+  // are always present; older turns get truncated instead. Per-entry
+  // head+tail truncation behavior unchanged: tool results often have
+  // signal at both ends so we keep the same MAX_ENTRY_CHARS strategy.
+  const reversedChunks: string[] = [];
   let total = 0;
+  let truncated = false;
 
-  for (const entry of entries) {
-    let text = entryToText(entry);
+  for (let i = entries.length - 1; i >= 0; i--) {
+    let text = entryToText(entries[i]);
     if (!text) continue;
     if (text.length > MAX_ENTRY_CHARS) {
-      // Tool results often have their interesting bits at both ends —
-      // command at the top, exit code/error at the bottom — so head+tail
-      // truncation preserves more signal than head-only.
       const headSize = Math.floor(MAX_ENTRY_CHARS * 0.7);
       const tailSize = MAX_ENTRY_CHARS - headSize - 50;
       text = text.slice(0, headSize) +
@@ -291,14 +349,19 @@ function buildWindowText(entries: any[]): string {
         text.slice(-tailSize);
     }
     if (total + text.length > MAX_WINDOW_CHARS) {
-      chunks.push("[...window truncated due to size...]");
+      truncated = true;
       break;
     }
-    chunks.push(text);
+    reversedChunks.push(text);
     total += text.length;
   }
 
-  return chunks.join("\n\n---\n\n");
+  // reversedChunks holds [newest, …, oldest]; flip back to chronological.
+  reversedChunks.reverse();
+  if (truncated) {
+    reversedChunks.unshift("[...older window entries truncated due to size...]");
+  }
+  return reversedChunks.join("\n\n---\n\n");
 }
 
 function isoDateFromTimestamp(value: unknown): string | undefined {
@@ -314,15 +377,68 @@ function buildRunWindow(target: string, state: TargetState): RunWindow | null {
 
   const entries = snapshot.entries;
   const headIdx = entries.findIndex((e) => e.id === state.pendingHeadEntryId);
-  if (headIdx === -1) return null;
+  if (headIdx === -1) {
+    // pendingHeadEntryId is gone from the branch — most likely the user
+    // forked or compacted between markPending() and tick(), or they
+    // switched to a sibling session. We can't process a window we can't
+    // locate. Returning null here lets the next markPending() refresh the
+    // snapshot and try again. Log so a stuck phase is visible in the
+    // sidecar trail.
+    try {
+      const projectRoot = snapshot.projectRoot;
+      const dir = path.join(projectRoot, ".pi-sediment");
+      fs.mkdirSync(dir, { recursive: true });
+      fs.appendFileSync(
+        path.join(dir, "sidecar.log"),
+        `${new Date().toISOString()} scheduler ${target}: pendingHead ${state.pendingHeadEntryId} not in current branch — awaiting next agent_end\n`,
+      );
+    } catch { /* best-effort */ }
+    return null;
+  }
   const headEntry = entries[headIdx];
   const sourceTimestamp = typeof headEntry?.timestamp === "string" ? headEntry.timestamp : undefined;
   const sourceDateIso = isoDateFromTimestamp(sourceTimestamp);
 
-  const lastIdx = state.lastProcessedEntryId
-    ? entries.findIndex((e) => e.id === state.lastProcessedEntryId)
-    : -1;
-  const startIdx = lastIdx >= 0 ? lastIdx + 1 : 0;
+  // lastProcessedEntryId is from the persisted state.json; the branch may
+  // have been compacted since (compaction replaces a run of entries with a
+  // single summary, deleting the original IDs). When that happens, findIndex
+  // returns -1 and we used to silently re-process from index 0 — which
+  // works but produces a giant window the first time. Differentiate the
+  // two cases:
+  //   - lastProcessedEntryId == null     → first run for this target,
+  //                                          start from beginning (fine)
+  //   - lastProcessedEntryId set, found  → normal incremental run
+  //   - lastProcessedEntryId set, gone   → RESET to head only (avoid
+  //                                          re-emitting the entire history;
+  //                                          the missing entries are gone
+  //                                          anyway, future windows will
+  //                                          continue from this head).
+  let startIdx: number;
+  if (!state.lastProcessedEntryId) {
+    startIdx = 0;
+  } else {
+    const lastIdx = entries.findIndex((e) => e.id === state.lastProcessedEntryId);
+    if (lastIdx >= 0) {
+      startIdx = lastIdx + 1;
+    } else {
+      // Recovery: lastProcessedEntryId no longer exists in the branch.
+      // Skip ahead to just the current head turn (window of size 1).
+      // This loses fidelity for the compacted range, but the alternative
+      // is replaying potentially hundreds of pre-compaction entries to
+      // every writer agent on every tick, which would burn LLM budget
+      // and likely produce a giant SKIP anyway.
+      startIdx = headIdx;
+      try {
+        const projectRoot = snapshot.projectRoot;
+        const dir = path.join(projectRoot, ".pi-sediment");
+        fs.mkdirSync(dir, { recursive: true });
+        fs.appendFileSync(
+          path.join(dir, "sidecar.log"),
+          `${new Date().toISOString()} scheduler ${target}: lastProcessed ${state.lastProcessedEntryId} compacted away — resetting window to head only\n`,
+        );
+      } catch { /* best-effort */ }
+    }
+  }
   if (startIdx > headIdx) return null;
 
   const windowEntries = entries.slice(startIdx, headIdx + 1);
@@ -409,6 +525,11 @@ function tick(target: string): void {
   emitPhase(target, state, "running");
   persist(state, target);
 
+  // Per-window classification: was the most recent worker outcome
+  // permanent (don't retry), retryable (back off and try again), or
+  // success? Promise.then captures this; the .finally branch consumes it.
+  let lastOutcome: "processed" | "failed_retryable" | "failed_permanent" = "processed";
+
   void state.worker(run)
     .then((result) => {
       if (result === "processed") {
@@ -417,36 +538,59 @@ function tick(target: string): void {
         state.lastSuccessAt = new Date().toISOString();
         state.lastError = undefined;
         state.lastErrorAt = undefined;
-      } else {
-        state.retryCount = (state.retryCount ?? 0) + 1;
-        state.lastError = "worker returned failed";
+        lastOutcome = "processed";
+      } else if (result === "failed_permanent") {
+        // Deterministic failure: do NOT retry. Force-advance immediately.
+        // This is the right behavior for "model not in registry" or
+        // "auth permanently broken" — retrying just burns budget for the
+        // same outcome. We treat it like processed-with-error: the
+        // checkpoint moves so future windows can run.
+        state.lastProcessedEntryId = run.toEntryId;
+        state.retryCount = 0;
+        state.lastError = "permanent failure — checkpoint force-advanced";
         state.lastErrorAt = new Date().toISOString();
+        lastOutcome = "failed_permanent";
+      } else {
+        // failed_retryable (or legacy "failed" alias). Increment the
+        // retry counter; the .finally block will schedule backoff or hit
+        // the MAX_RETRIES safety net.
+        state.retryCount = (state.retryCount ?? 0) + 1;
+        state.lastError = result === "failed"
+          ? "worker returned failed (legacy — treat as retryable)"
+          : "worker returned failed_retryable";
+        state.lastErrorAt = new Date().toISOString();
+        lastOutcome = "failed_retryable";
       }
     })
     .catch((e) => {
-      state.retryCount = (state.retryCount ?? 0) + 1;
-      state.lastError = e?.message ?? String(e);
+      // Uncaught worker exceptions are deterministic by definition (the
+      // window deterministically reproduces the throw). Treat as
+      // permanent so we don't retry-storm on a bug.
+      state.lastProcessedEntryId = run.toEntryId;
+      state.retryCount = 0;
+      state.lastError = `worker threw — ${e?.message ?? String(e)}`;
       state.lastErrorAt = new Date().toISOString();
+      lastOutcome = "failed_permanent";
     })
     .finally(() => {
       state.running = false;
 
-      // Hard retry cap: a deterministic failure (model output malformed for
-      // THIS window, sanitize hits, etc.) will reproduce on every retry and
-      // burn LLM minutes forever. After MAX_RETRIES, give up on this window
-      // by force-advancing the checkpoint to the pending head. Future windows
-      // can re-discover the insight if it's durable.
-      //
-      // Workers should normally return "processed" (success or skip) so we
-      // never reach this; the cap is a safety net for cases where a code
-      // path still returns "failed" that's actually deterministic.
-      const MAX_RETRIES = 5;
-      if ((state.retryCount ?? 0) >= MAX_RETRIES &&
+      // Hard retry cap: applies ONLY to retryable failures. Permanent
+      // failures already advanced the checkpoint (see above), so this
+      // safety net catches a long-running provider outage where every
+      // retry is a transient network error. After MAX_RETRIES_RETRYABLE
+      // tries (with exp backoff capped at 60s, so worst-case ~5 minutes
+      // of attempts), give up and advance the checkpoint anyway. The
+      // alternative — retrying forever — means a single broken model
+      // can wedge sediment until the user notices and restarts.
+      const MAX_RETRIES_RETRYABLE = 8;
+      if (lastOutcome === "failed_retryable" &&
+          (state.retryCount ?? 0) >= MAX_RETRIES_RETRYABLE &&
           state.pendingHeadEntryId !== state.lastProcessedEntryId) {
         const dropped = state.pendingHeadEntryId;
         state.lastProcessedEntryId = state.pendingHeadEntryId;
         state.retryCount = 0;
-        state.lastError = `gave up after ${MAX_RETRIES} retries (last: ${state.lastError ?? "unknown"})`;
+        state.lastError = `gave up after ${MAX_RETRIES_RETRYABLE} retryable failures (last: ${state.lastError ?? "unknown"})`;
         state.lastErrorAt = new Date().toISOString();
         // Surface clearly in sidecar.log so the user sees the bail-out.
         const projectRoot = state.latestSnapshot?.projectRoot;
@@ -456,7 +600,7 @@ function tick(target: string): void {
             fs.mkdirSync(dir, { recursive: true });
             fs.appendFileSync(
               path.join(dir, "sidecar.log"),
-              `${new Date().toISOString()} scheduler ${target}: gave up after ${MAX_RETRIES} retries, force-advancing to ${dropped}\n`,
+              `${new Date().toISOString()} scheduler ${target}: gave up after ${MAX_RETRIES_RETRYABLE} retryable failures, force-advancing to ${dropped}\n`,
             );
           } catch { /* silent */ }
         }

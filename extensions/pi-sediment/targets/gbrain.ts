@@ -79,10 +79,18 @@ export async function writeToGbrainWithRetry(
   maxAttempts: number = 3,
 ): Promise<boolean> {
   // ── Pre-write non-Latin guard ────────────────────────────
-  // gbrain is an English-only knowledge base. If the entry contains
-  // non-Latin content (e.g. Chinese title/body), translate it BEFORE
-  // the first write attempt. Otherwise the first write succeeds with
-  // non-English content and the retry translation path is never reached.
+  // gbrain is an English-only knowledge base (the underlying tsvector index
+  // does not handle CJK). If the entry contains non-Latin content (e.g.
+  // Chinese title/body), translate it BEFORE the first write attempt.
+  //
+  // Hard rule: if translation FAILS, BLOCK the write. The previous policy
+  // ("attempting raw write") shipped Chinese pages into gbrain, where the
+  // CLI silently accepts them — the search index then returns Chinese pages
+  // for English queries (or vice versa), polluting the brain bilingually
+  // with no error surfaced to the user. Better to drop the page; the
+  // scheduler will advance the checkpoint past the un-translatable window
+  // (caller returns "processed") and future windows can re-discover the
+  // insight if it's durable.
   let current = entry;
   if (translateFn && (isNonLatin(entry.title) || isNonLatin(entry.content))) {
     logLine(projectRoot, `gbrain pre-translate: non-Latin detected title="${entry.title.slice(0, 60)}"`);
@@ -91,8 +99,18 @@ export async function writeToGbrainWithRetry(
       current = translated;
       logLine(projectRoot, `gbrain pre-translate: ok title="${translated.title.slice(0, 60)}"`);
     } else {
-      logLine(projectRoot, `gbrain pre-translate: failed, attempting raw write`);
+      // Return false so the worker (processGbrain) sees a write failure;
+      // it converts that to RunResult "processed" so the checkpoint
+      // advances rather than burning 5 retries on the same untranslatable
+      // window.
+      logLine(projectRoot, `gbrain pre-translate: failed — BLOCKING non-Latin write to advance checkpoint`);
+      return false;
     }
+  } else if (!translateFn && (isNonLatin(entry.title) || isNonLatin(entry.content))) {
+    // No translateFn and content is non-Latin: same blocking policy.
+    // Surface this in logs so the operator knows translation is unwired.
+    logLine(projectRoot, `gbrain write: BLOCKED non-Latin content with no translateFn registered`);
+    return false;
   }
 
   // Attempt 1: write (possibly already translated above)

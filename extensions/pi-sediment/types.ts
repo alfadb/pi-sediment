@@ -15,30 +15,17 @@ export interface TargetStatus {
   gbrainPageCount: number | null;
 }
 
-// ── Per-target evaluator I/O ────────────────────────────────────
-
-export interface GbrainEvalResult {
-  decision: "skip" | "sediment";
-  /** One-sentence summary of the insight (only meaningful when sediment). */
-  summary: string;
-}
-
 // ── gbrain writer I/O ───────────────────────────────────────────
+//
+// Note: GbrainEvalResult and GbrainWriteInput were removed when the legacy
+// two-stage evaluator+writer pipeline (writer.ts/evaluator.ts) was deleted in
+// favor of the agent-loop path (gbrain-agent.ts). See gbrain-agent.ts'
+// GbrainAgentResult discriminated union for the current decision shape.
 
 export interface GbrainSearchResult {
   slug: string;
   title: string;
   snippet: string;
-}
-
-export interface GbrainWriteInput {
-  summary: string;
-  dateIso: string;
-  lastAssistantMessage: string;
-  /** Related gbrain pages used for frontmatter auto-link extraction. */
-  relatedPages: GbrainSearchResult[];
-  /** Format error feedback for retry (undefined on first attempt). */
-  formatError?: string;
 }
 
 export interface GbrainWriteOutput {

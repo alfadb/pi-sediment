@@ -263,12 +263,13 @@ async function processGbrain(
     return "processed";
   }
   if (result.kind === "parse_failure") {
-    // Treat as skip: the model's terminal output was malformed (no SKIP, no
-    // SKIP_DUPLICATE, no ## GBRAIN). Returning "failed" makes the scheduler
-    // retry the same window; with a deterministic prompt and the same source
-    // material the model will produce similar malformed output, burning
-    // minutes per retry. Advance the checkpoint and let future windows
-    // re-discover the insight if it's durable.
+    // Deterministic: the model's terminal output was malformed (no SKIP,
+    // no SKIP_DUPLICATE, no ## GBRAIN). With the same prompt + same source,
+    // a retry produces the same malformed output — burns minutes for no
+    // progress. Advance the checkpoint; future windows can re-discover the
+    // insight. We mark this as "processed" rather than failed_permanent
+    // because semantically the window IS done; there's just no page to
+    // write. The scheduler treats both identically (advance + reset retry).
     logLine(window.projectRoot, `gbrain pipeline: parse failure — dropping write, advancing checkpoint`);
     return "processed";
   }
@@ -289,7 +290,16 @@ async function processGbrain(
 
   const ok = await writeToGbrainWithRetry(enriched, window.projectRoot, translateFn);
   logLine(window.projectRoot, `sediment done: gbrain=${ok ? "✓" : "✗"}`);
-  return ok ? "processed" : "failed";
+  // gbrain CLI write failures are typically transient (network, throttle,
+  // gbrain server restart). The retry helper inside writeToGbrainWithRetry
+  // already exhausts internal retries before returning false; classifying
+  // as failed_retryable lets the scheduler take one more shot on its own
+  // backoff schedule (covers cross-process gbrain unavailability windows
+  // longer than the inner 1+2s retry budget). Truly deterministic write
+  // refusals (e.g. content too large — see writeToGbrain) already log
+  // their reason and won't recover via retry; the MAX_RETRIES_RETRYABLE
+  // safety net force-advances after ~5 minutes of attempts.
+  return ok ? "processed" : "failed_retryable";
 }
 
 // ── Pensieve pipeline (single LLM call: evaluate + write) ─────
@@ -309,8 +319,13 @@ async function processPensieve(
     return "processed";
   }
 
-  logLine(window.projectRoot, `sediment done: pensieve=✗`);
-  return "failed";
+  // pensieve-writer's only "failed" path is auth/model resolution errors
+  // and uncaught exceptions. Both are deterministic for the current
+  // configuration; retrying with the same model/key set produces the same
+  // failure. Classify as permanent so the scheduler force-advances
+  // immediately rather than burning 8 retries on a bad config.
+  logLine(window.projectRoot, `sediment done: pensieve=✗ (permanent — likely model/auth)`);
+  return "failed_permanent";
 }
 
 // ── Extension entry ────────────────────────────────────────────
@@ -415,7 +430,15 @@ export default function piSediment(pi: ExtensionAPI) {
       sessionId: ctx.sessionManager.getSessionFile?.() ?? ctx.sessionManager.getSessionId?.() ?? "ephemeral",
       projectRoot: ctx.cwd,
       headEntryId: head.id,
-      entries: branch,
+      // Shallow-copy the branch array so subsequent in-place mutations
+      // (compaction, branch_summary insertion, fork) don't reshuffle the
+      // entries the scheduler is iterating. The entry OBJECTS are still
+      // shared (cheap), but their order in this snapshot is frozen at
+      // agent_end time — which is what buildRunWindow's findIndex needs.
+      // Without this, a long-running worker can come back to an array
+      // whose entry IDs are reshuffled, producing -1 from findIndex and a
+      // silent dropped window.
+      entries: [...branch],
       // Snapshot the live registry; workers use this instead of any captured ctx.
       modelRegistry: ctx.modelRegistry,
     };

@@ -38,24 +38,50 @@ const MAX_LIST_ENTRIES = 300;
  * Resolve a user-supplied relative path against `<projectRoot>/.pensieve`,
  * rejecting any escape outside that subtree. Returns an absolute path or
  * null if the input tries to break out (../, absolute paths, symlink games).
+ *
+ * TOCTOU symlink defense
+ * ----------------------
+ * The lexical check (path.resolve + prefix-string compare) is necessary but
+ * not sufficient: a symlink at .pensieve/evil.md → /etc/passwd would pass
+ * the prefix check but fs.readFileSync(abs) would follow it and ship
+ * arbitrary file contents back to the LLM. A prompt-injected sediment agent
+ * is a real threat model here — it controls the relPath argument to
+ * pensieve_read / pensieve_grep.
+ *
+ * Defense: realpath both root and resolved path, then prefix-check. We use
+ * sync realpath rather than the async variant because this is on the
+ * synchronous tool-handler hot path; the cost is one stat per call.
+ * Missing files are still allowed (we only fail if a *resolved* path
+ * escapes); creating a non-symlink file inside .pensieve/ never escapes,
+ * and a non-existent path simply won't be readable by the caller anyway.
  */
 function resolvePensievePath(projectRoot: string, relPath: string): string | null {
   if (typeof relPath !== "string") return null;
-  const root = path.resolve(projectRoot, ".pensieve");
+  const rootRaw = path.resolve(projectRoot, ".pensieve");
   const trimmed = relPath.trim();
   // Empty / "." / "./" / ".pensieve" all mean "the .pensieve root itself".
   // Returning null on empty was the original behavior, but the agent often
   // omits the path arg when it wants to scope to all of .pensieve/, and a
   // null here surfaces as a confusing 'path escapes' error.
   if (!trimmed || trimmed === "." || trimmed === "./" || trimmed === ".pensieve" || trimmed === "./pensieve") {
-    return root;
+    return rootRaw;
   }
   // Reject absolute paths up front (security) so they don't get resolved
   // anywhere relative to root and accidentally pass the prefix check.
   if (path.isAbsolute(trimmed)) return null;
   // Strip leading ".pensieve/" since the tool surface is rooted there.
   const cleaned = trimmed.replace(/^\.?pensieve[/\\]/, "");
-  const abs = path.resolve(root, cleaned);
+  const absRaw = path.resolve(rootRaw, cleaned);
+
+  // realpath both sides. If the path doesn't exist yet, realpath throws
+  // ENOENT — fall back to the lexical resolution (a non-existent path
+  // can't be a symlink to a secret). If realpath succeeds, use the
+  // resolved real paths for containment so symlink-out is caught.
+  let root: string;
+  let abs: string;
+  try { root = fs.realpathSync(rootRaw); } catch { root = rootRaw; }
+  try { abs = fs.realpathSync(absRaw); } catch { abs = absRaw; }
+
   if (!abs.startsWith(root + path.sep) && abs !== root) return null;
   return abs;
 }

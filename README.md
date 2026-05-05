@@ -79,24 +79,31 @@ pi-sediment（自动，每轮对话后）
 ```
 agent_end（每轮对话结束）
   ↓
-推入队列（不阻塞主会话，0 token / 0 延迟）
+markPending(target)：记下本次 head entry id（0 token / 0 延迟）
   ↓
-worker 逐条消费：
-  evaluator（可配置，默认 deepseek/deepseek-v4-pro）→ skip / sediment
-  ↓ sediment
-  writer（单次调用，双输出）
-  ├─ Pensieve 条目：项目级"怎么修"
-  └─ gbrain 条目：世界级"怎么避免"
+scheduler（每个 target 独立状态机：idle↔pending↔running）
   ↓
-Promise.all([写 Pensieve, 写 gbrain（含重试 + 非拉丁语翻译）]) → 通知用户
+依据 checkpoint 构建窗口（lastProcessedEntryId → pendingHeadEntryId）
+  → 冲突同一 target 只保留最新 head（coalescing）
+  ↓
+agent-loop 运行：默认 deepseek-v4-pro，reasoning=high，只读 tool（gbrain_search／pensieve_grep等）
+  → SKIP / SKIP_DUPLICATE / NEW / UPDATE 语义输出
+  ↓
+Pensieve 与 gbrain 独立 pipeline 并行推进；失败按【可重试】／【永久】分类处理
 ```
 
 ### 关键设计
 
-- **无正则预过滤** — 不做消息长度/问句匹配等启发式，全部交由模型判断
-- **In-process sidecar** — 评估和写入在 detached async 中完成，不污染主会话上下文
-- **队列消费** — 上限 20 条，串行处理，本条双写完成才消费下一条
-- **冷启动加速** — gbrain < 10 页时，evaluator 更积极判定 sediment
+- **Coalescing checkpoint scheduler** — **不是 FIFO 队列**。每个 target 独立维护
+  `lastProcessedEntryId → pendingHeadEntryId` 区间；worker 跑的时候新来的轮
+  只更新 pendingHead 。这意味着长会话中连击 5 轮产生的是 1 个带 5 轮详
+  情的窗口，而不是 5 个背背背背起背的零碎 LLM 调用。
+- **In-process sidecar** — 调度和写入在 detached async 中完成，不污染主会话上下文
+- **Read-only lookup tools 驱动 dedupe** — writer agent 在决定写之前必须
+  `gbrain_search、pensieve_grep` 检查已存。到同样主题会选 UPDATE 而非新建。
+- **冷启动加速** — gbrain < 10 页时，writer 更积极地判定 NEW
+- **三态 RunResult** — `processed`/`failed_retryable`/`failed_permanent`。瀑布不
+  谝入 5 次硬上限，只有多发 retry 失败才有；确定性失败下只推进一次。
 - **零配置** — 检测到目标即启用，无需开关
 
 ## 配置
@@ -125,19 +132,26 @@ export PI_SEDIMENT_REASONING="high"
 pi-sediment/
 ├── package.json
 └── extensions/pi-sediment/
-    ├── index.ts            # 入口：session_start/before_agent_start/agent_end/session_shutdown
+    ├── index.ts            # 入口：session_start / agent_end，跳过不干净轮
     ├── detector.ts         # 自动检测 Pensieve + gbrain
-    ├── queue.ts            # 内存队列（上限 20，串行消费）
-    ├── evaluator.ts        # 模型评估 skip/sediment（含冷启动加速）
-    ├── writer.ts           # 单次调用，双输出（Pensieve + gbrain）
-    ├── prompts.ts          # evaluator + writer 的 prompt
+    ├── scheduler.ts        # 每 target 独立的 coalescing checkpoint 状态机
+    ├── agent-loop.ts       # 多轮 LLM 循环（醉服 completeSimple + tool dispatch）
+    ├── lookup-tools.ts     # 只读探针：gbrain_search/get + pensieve_grep/read/list
+    ├── gbrain-agent.ts     # gbrain pipeline：agent loop + 语义输出解析
+    ├── pensieve-writer.ts  # pensieve pipeline：agent loop + .pensieve/ 写入
+    ├── prompts.ts          # GBRAIN_AGENT_PROMPT + sanitizeContent（位置感知）
     ├── config.ts           # 模型配置（env > 项目 config > 默认）
     ├── types.ts            # 共享类型
-    ├── utils.ts            # 共享工具
+    ├── utils.ts            # gbrainCommand / sanitizeSlug / isNonLatin / logLine
     └── targets/
-        ├── pensieve.ts     # 写 .pensieve/short-term/（自动 promote）
-        └── gbrain.ts       # gbrain_put via CLI（含重试 + 非拉丁语 LLM 翻译）
+        └── gbrain.ts       # gbrain put via CLI（含重试 + 预翻译纪律）
 ```
+
+### 运营面
+
+- `~/<project>/.pi-sediment/state.json` — checkpoint 持久化。原子写入（`.tmp` + rename）避免崩溃后起则丢状态。
+- `~/<project>/.pi-sediment/sidecar.log` — 单行结构化日志，超 2MB 轮转。
+- `~/<project>/.pi-sediment/parse-failures/` — 被 sanitize / 协议解析发出去的 raw payload，供事后检验。
 
 ## License
 
