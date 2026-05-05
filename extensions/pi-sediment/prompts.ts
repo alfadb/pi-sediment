@@ -21,13 +21,40 @@ import type { GbrainSearchResult } from "./types.js";
 //      not arbitrary tool calls
 //   3. this content sanitize — last-line catch of the most overt patterns
 //
+// Position-aware matching
+// -----------------------
+// A real prompt-injection payload must steer the LLM at the start of its
+// reasoning context to be effective — "ignore previous instructions" buried
+// 10 paragraphs into a knowledge page about *how injection patterns are
+// detected* doesn't actually inject anything; it's a documentation example.
+// Verified failure mode (2026-05-05): sediment writing a page about its
+// own contentToText changes was rejected because the page legitimately
+// described the INJECTION_PATTERNS regex literals ("you are now",
+// "override:", etc.) as documentation. Sanitizer treated documentation as
+// attack and dropped the write, advancing checkpoint past a real insight.
+//
+// Mitigation: only check the first INJECTION_CHECK_PREFIX_CHARS characters
+// of the content. A genuine injection has to land near the top to influence
+// the model; later occurrences are descriptive prose. This trades a tiny
+// amount of theoretical robustness (an attacker controlling content past
+// position N can still attempt injection) for a large amount of practical
+// false-positive elimination.
+//
+// We ALSO require a frontmatter-aware check: if content begins with a
+// markdown frontmatter block (---\n...\n---\n), look at the body following
+// the closing ---, not the frontmatter itself. Frontmatter is structured
+// metadata (title/tags/etc.) and never contains payload phrasing in
+// practice; including it in the check shifts the prefix window past the
+// real opening prose unnecessarily.
+//
 // Originally we copied a wide pattern set from pi-gstack including bare
 // '\bsystem:' / '\buser:' / '\bassistant:'. Those are vocabulary that
 // appears constantly in normal technical writing about prompt design and
 // agent loops; they produced 100% false-positive rate during meta-discussion
 // of pi-sediment itself (3 hits in one session, all on legitimate prose).
 // The remaining patterns target unambiguous imperative phrasings that have
-// no natural use in engineering prose.
+// no natural use in engineering prose — but even those can appear as
+// documentation examples, hence the prefix-check above.
 export const INJECTION_PATTERNS: RegExp[] = [
   /ignore\s+(all\s+)?previous\s+(instructions|context|rules)/i,
   /you\s+are\s+now\s+/i,
@@ -38,13 +65,34 @@ export const INJECTION_PATTERNS: RegExp[] = [
   /approve\s+(all|every|this)/i,
 ];
 
+// How many characters of body content (post-frontmatter) to scan for
+// injection patterns. 600 chars covers the typical "# Title\n\n## Principle\n"
+// + opening paragraph — the only place a real injection can land. Anything
+// past this is treated as prose that may legitimately discuss the patterns.
+const INJECTION_CHECK_PREFIX_CHARS = 600;
+
+/**
+ * Strip a leading YAML frontmatter block (--- ... ---\n) if present.
+ * Returns the body text. Sediment writers tend to emit frontmatter when
+ * generating pensieve markdown; gbrain writers usually don't. Either way,
+ * the prefix scan should be against the body, not metadata.
+ */
+function stripFrontmatter(content: string): string {
+  if (!content.startsWith("---\n")) return content;
+  const closing = content.indexOf("\n---\n", 4);
+  if (closing < 0) return content; // malformed; leave it alone
+  return content.slice(closing + 5);
+}
+
 /**
  * Sanitize LLM-generated content against prompt injection patterns.
- * Returns null if a pattern matches (content rejected).
+ * Returns null if a pattern matches in the content's opening prose.
  */
 export function sanitizeContent(content: string): string | null {
+  const body = stripFrontmatter(content);
+  const prefix = body.slice(0, INJECTION_CHECK_PREFIX_CHARS);
   for (const pat of INJECTION_PATTERNS) {
-    if (pat.test(content)) return null;
+    if (pat.test(prefix)) return null;
   }
   return content;
 }
