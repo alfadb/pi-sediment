@@ -18,7 +18,7 @@ import * as path from "node:path";
 import * as os from "node:os";
 import { formatModelRef, loadConfig } from "./config.js";
 import { sanitizeContent } from "./prompts.js";
-import { sanitizeSlug } from "./utils.js";
+import { sanitizeSlug, saveParseFailure } from "./utils.js";
 import { runAgentLoop } from "./agent-loop.js";
 import { buildLookupTools } from "./lookup-tools.js";
 import type { ResolvedModel } from "./types.js";
@@ -297,8 +297,15 @@ export async function writePensieve(
     // the injection filter. Retrying the same window will produce similar
     // content and trip again — wasted minutes for no progress. Skip and
     // advance the checkpoint; future windows can re-discover the insight.
+    //
+    // Save the rejected payload so we can audit WHICH content tripped the
+    // filter. Pensieve writes go to project-local .pensieve/ rather than a
+    // global brain, so a false positive here is locally recoverable, but
+    // only if we can see what was rejected. Without this trail the only
+    // signal is one log line and a silent checkpoint advance.
     if (!sanitizeContent(content)) {
-      logLine(projectRoot, `${tag} sanitize:reject — dropping write, advancing checkpoint`);
+      saveParseFailure(content, projectRoot, "injection", "pensieve-writer");
+      logLine(projectRoot, `${tag} sanitize:reject — dropping write, advancing checkpoint (saved to parse-failures/)`);
       return "skipped";
     }
 

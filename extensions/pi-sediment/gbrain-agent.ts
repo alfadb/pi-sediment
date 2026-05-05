@@ -20,7 +20,7 @@ import { formatModelRef, loadConfig } from "./config.js";
 import { runAgentLoop } from "./agent-loop.js";
 import { buildLookupTools } from "./lookup-tools.js";
 import { GBRAIN_AGENT_PROMPT, buildGbrainAgentPrompt, sanitizeContent } from "./prompts.js";
-import { sanitizeSlug } from "./utils.js";
+import { sanitizeSlug, saveParseFailure } from "./utils.js";
 import type { GbrainWriteOutput, ResolvedModel, TargetStatus } from "./types.js";
 
 // ── Helpers ────────────────────────────────────────────────────
@@ -136,8 +136,15 @@ function parseGbrainAgentOutput(text: string, projectRoot: string): GbrainAgentR
   // makes the scheduler retry the same window, which will produce similar
   // content and trip the filter again. Drop the write and advance the
   // checkpoint; future windows can re-discover the insight.
+  //
+  // Save the rejected payload to .pi-sediment/parse-failures/ so we can
+  // post-mortem WHICH content tripped the filter. Without this trail, a
+  // false-positive sanitizer hit (or a regression in legitimate writer
+  // output) is invisible — we'd see only the log line and the lost
+  // checkpoint window, with no way to inspect the actual rejected text.
   if (!sanitizeContent(content)) {
-    logLine(projectRoot, `gbrain-agent sanitize:reject — dropping write, advancing checkpoint`);
+    saveParseFailure(content, projectRoot, "injection", "gbrain-agent");
+    logLine(projectRoot, `gbrain-agent sanitize:reject — dropping write, advancing checkpoint (saved to parse-failures/)`);
     return { kind: "skip" };
   }
 
