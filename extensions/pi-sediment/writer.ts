@@ -12,6 +12,7 @@ import * as path from "node:path";
 import { formatModelRef, loadConfig } from "./config.js";
 import { GBRAIN_WRITE_PROMPT, buildGbrainWritePrompt, sanitizeContent } from "./prompts.js";
 import type { GbrainWriteInput, GbrainWriteOutput, ResolvedModel } from "./types.js";
+import { logLine } from "./utils.js";
 
 // ── Helpers ────────────────────────────────────────────────────
 
@@ -118,13 +119,6 @@ function extractField(header: string, field: string): string | null {
   return match?.[1]?.trim() ?? null;
 }
 
-function logLine(projectRoot: string, line: string): void {
-  try {
-    const dir = path.join(projectRoot, ".pi-sediment");
-    fs.mkdirSync(dir, { recursive: true });
-    fs.appendFileSync(path.join(dir, "sidecar.log"), `${new Date().toISOString()} ${line}\n`);
-  } catch { /* silent */ }
-}
 
 function saveParseFailure(raw: string, projectRoot: string, reason: string): void {
   try {

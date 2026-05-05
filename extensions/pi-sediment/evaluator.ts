@@ -12,6 +12,7 @@ import * as path from "node:path";
 import { formatModelRef, loadConfig, type SedimentConfig } from "./config.js";
 import { GBRAIN_EVAL_PROMPT, buildGbrainEvalPrompt } from "./prompts.js";
 import type { GbrainEvalResult, ResolvedModel, TargetStatus } from "./types.js";
+import { logLine } from "./utils.js";
 
 // ── Helpers ────────────────────────────────────────────────────
 
@@ -44,13 +45,6 @@ function extractEvalJson(text: string): GbrainEvalResult | null {
   };
 }
 
-function logLine(projectRoot: string, line: string): void {
-  try {
-    const dir = path.join(projectRoot, ".pi-sediment");
-    fs.mkdirSync(dir, { recursive: true });
-    fs.appendFileSync(path.join(dir, "sidecar.log"), `${new Date().toISOString()} ${line}\n`);
-  } catch { /* silent */ }
-}
 
 // ── Public ─────────────────────────────────────────────────────
 

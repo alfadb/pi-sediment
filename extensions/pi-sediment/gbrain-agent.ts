@@ -20,7 +20,7 @@ import { formatModelRef, loadConfig } from "./config.js";
 import { runAgentLoop } from "./agent-loop.js";
 import { buildLookupTools } from "./lookup-tools.js";
 import { GBRAIN_AGENT_PROMPT, buildGbrainAgentPrompt, sanitizeContent } from "./prompts.js";
-import { sanitizeSlug, saveParseFailure } from "./utils.js";
+import { logLine, sanitizeSlug, saveParseFailure } from "./utils.js";
 import type { GbrainWriteOutput, ResolvedModel, TargetStatus } from "./types.js";
 
 // ── Helpers ────────────────────────────────────────────────────
@@ -38,13 +38,6 @@ async function resolveModel(
   return { model: m, apiKey: auth.apiKey, headers: auth.headers, display: formatModelRef(config.model) };
 }
 
-function logLine(projectRoot: string, line: string): void {
-  try {
-    const dir = path.join(projectRoot, ".pi-sediment");
-    fs.mkdirSync(dir, { recursive: true });
-    fs.appendFileSync(path.join(dir, "sidecar.log"), `${new Date().toISOString()} ${line}\n`);
-  } catch { /* silent */ }
-}
 
 function extractField(header: string, field: string): string | null {
   const regex = new RegExp(`^${field}:\\s*(.+)$`, "mi");

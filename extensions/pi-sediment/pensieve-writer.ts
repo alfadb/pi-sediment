@@ -18,7 +18,7 @@ import * as path from "node:path";
 import * as os from "node:os";
 import { formatModelRef, loadConfig } from "./config.js";
 import { sanitizeContent } from "./prompts.js";
-import { sanitizeSlug, saveParseFailure } from "./utils.js";
+import { logLine, sanitizeSlug, saveParseFailure } from "./utils.js";
 import { runAgentLoop } from "./agent-loop.js";
 import { buildLookupTools } from "./lookup-tools.js";
 import type { ResolvedModel } from "./types.js";
@@ -147,13 +147,6 @@ function extractField(text: string, field: string): string | null {
   return match?.[1]?.trim() ?? null;
 }
 
-function logLine(projectRoot: string, line: string): void {
-  try {
-    const dir = path.join(projectRoot, ".pi-sediment");
-    fs.mkdirSync(dir, { recursive: true });
-    fs.appendFileSync(path.join(dir, "sidecar.log"), `${new Date().toISOString()} ${line}\n`);
-  } catch { /* silent */ }
-}
 
 // ── Public ─────────────────────────────────────────────────────
 

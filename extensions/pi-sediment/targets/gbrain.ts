@@ -12,7 +12,7 @@ import { promisify } from "node:util";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { gbrainCommand, isNonLatin, sanitizeSlug } from "../utils.js";
+import { gbrainCommand, isNonLatin, logLine, sanitizeSlug } from "../utils.js";
 import type { GbrainWriteOutput, GbrainSearchResult } from "../types.js";
 
 const execFileP = promisify(execFile);
@@ -27,14 +27,6 @@ const MAX_CONTENT_BYTES = 96 * 1024;
 function throttleErr(stderr: string): boolean {
   const kw = ["throttle", "rate limit", "capacity", "busy"];
   return kw.some((k) => stderr.toLowerCase().includes(k));
-}
-
-function logLine(projectRoot: string, line: string): void {
-  try {
-    const dir = path.join(projectRoot, ".pi-sediment");
-    fs.mkdirSync(dir, { recursive: true });
-    fs.appendFileSync(path.join(dir, "sidecar.log"), `${new Date().toISOString()} ${line}\n`);
-  } catch { /* silent */ }
 }
 
 /** Wrap body content with minimal YAML frontmatter (gbrain --content requires it). */

@@ -32,6 +32,7 @@ import {
 } from "./targets/gbrain.js";
 import { writePensieve } from "./pensieve-writer.js";
 import { loadConfig } from "./config.js";
+import { logLine } from "./utils.js";
 import { completeSimple } from "@mariozechner/pi-ai";
 import type { TargetStatus } from "./types.js";
 import * as fs from "node:fs";
@@ -39,13 +40,6 @@ import * as path from "node:path";
 
 // ── Helpers ────────────────────────────────────────────────────
 
-function logLine(projectRoot: string, line: string): void {
-  try {
-    const dir = path.join(projectRoot, ".pi-sediment");
-    fs.mkdirSync(dir, { recursive: true });
-    fs.appendFileSync(path.join(dir, "sidecar.log"), `${new Date().toISOString()} ${line}\n`);
-  } catch { /* silent */ }
-}
 
 const STATUS_PENSIEVE = "pi-sediment-pensieve";
 const STATUS_GBRAIN = "pi-sediment-gbrain";

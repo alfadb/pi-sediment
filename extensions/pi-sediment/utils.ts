@@ -112,3 +112,85 @@ export function saveParseFailure(
     /* observability is best-effort; never block the writer on disk errors */
   }
 }
+
+
+/**
+ * Append a one-line entry to .pi-sediment/sidecar.log with an ISO-8601
+ * timestamp prefix.
+ *
+ * Hard rules
+ * ----------
+ *  1. ONE line per call. Embedded newlines/CRs are escaped as `\\n`/`\\r`
+ *     so a misbehaving caller (e.g. a CLI subprocess that returns a 503
+ *     HTML error page in stderr and the caller dumps the first 200 bytes
+ *     verbatim) cannot pollute the log with multi-line garbage. Every line
+ *     in sidecar.log starts with an ISO-8601 timestamp; tooling can rely
+ *     on that.
+ *
+ *  2. Cap each line at LOG_LINE_MAX_CHARS. Pathologically long lines
+ *     (entire HTML pages, base64-encoded images, full transcripts) are
+ *     truncated with a [...truncated N chars] marker. Forensic value is
+ *     in the *fact* that something happened, plus the head/tail; the
+ *     middle of a 500KB blob doesn't help anyone.
+ *
+ *  3. Rotate sidecar.log when it crosses LOG_ROTATE_BYTES. The current
+ *     file becomes sidecar.log.1; if a sidecar.log.1 already exists, it
+ *     is overwritten (single-generation rotation — we keep the most
+ *     recent rotation as forensic backup but don't accumulate dozens of
+ *     numbered files). Rotation cost: one rename(); no copy, no read.
+ *     Triggered lazily on each write so there is no separate timer or
+ *     cron dependency.
+ *
+ *  4. Silent on I/O failure. Logging is observability infrastructure, not
+ *     load-bearing logic. If the disk is full, sediment continues working
+ *     blind rather than crashing.
+ *
+ * The five sediment writer/agent files used to each carry an identical
+ * private copy of this function. Lifting the implementation here:
+ *  - eliminates DRY violation
+ *  - lets us fix the multi-line-pollution bug once
+ *  - lets us add rotation once instead of in five places
+ */
+
+const LOG_LINE_MAX_CHARS = 1000;
+const LOG_ROTATE_BYTES = 2_000_000; // 2 MB — ~20K typical lines
+
+function escapeForLog(line: string): string {
+  // Replace embedded newlines/CRs with literal \n / \r so the line stays
+  // single-row in the on-disk log. Tabs are preserved (low collision risk
+  // and useful in diff/lookup output).
+  return line.replace(/\r/g, "\\r").replace(/\n/g, "\\n");
+}
+
+function rotateIfNeeded(logPath: string): void {
+  try {
+    const stat = fs.statSync(logPath);
+    if (stat.size < LOG_ROTATE_BYTES) return;
+    const rotated = `${logPath}.1`;
+    // Single-generation: a previous .1 is overwritten by the rename.
+    // Node's fs.renameSync already replaces the destination on POSIX, so
+    // no explicit unlink needed. If rename fails we silently continue
+    // appending; better than throwing.
+    fs.renameSync(logPath, rotated);
+  } catch {
+    /* rotation is best-effort */
+  }
+}
+
+export function logLine(projectRoot: string, line: string): void {
+  try {
+    const dir = path.join(projectRoot, ".pi-sediment");
+    fs.mkdirSync(dir, { recursive: true });
+    const logPath = path.join(dir, "sidecar.log");
+    rotateIfNeeded(logPath);
+    let safe = escapeForLog(line);
+    if (safe.length > LOG_LINE_MAX_CHARS) {
+      const elided = safe.length - LOG_LINE_MAX_CHARS + 50;
+      safe = safe.slice(0, LOG_LINE_MAX_CHARS - 50) +
+        `[...${elided} chars truncated...]`;
+    }
+    fs.appendFileSync(logPath, `${new Date().toISOString()} ${safe}\n`);
+  } catch {
+    /* silent: logging must never crash the writer */
+  }
+}
